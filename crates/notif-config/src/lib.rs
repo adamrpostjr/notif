@@ -113,6 +113,11 @@ async fn watch_impl(
         .ok_or("config path has no file name")?
         .to_owned();
 
+    // The config directory may not exist yet (fresh install with no config
+    // file). Create it so the watch can be established — otherwise hot-reload
+    // would silently never work until the daemon restarts.
+    std::fs::create_dir_all(parent)?;
+
     let mut inotify = Inotify::init()?;
     inotify
         .watches()
@@ -327,6 +332,44 @@ mod tests {
 
         let event = result.expect("expected a ConfigEvent but timed out");
         assert_eq!(event.0.max_visible, 7);
+    }
+
+    #[test]
+    fn test_watcher_creates_missing_config_dir() {
+        // Fresh install: the config directory does not exist yet. The watcher
+        // must create it and still deliver reload events for a config file
+        // written later.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("notif");
+        let config_path = config_dir.join("config.toml");
+        assert!(!config_dir.exists());
+
+        let (tx, rx) = async_channel::bounded::<notif_types::ConfigEvent>(1);
+
+        let watch_path = config_path.clone();
+        std::thread::spawn(move || {
+            async_io::block_on(watch(watch_path, tx));
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(config_dir.exists(), "watcher should create the config dir");
+
+        let tmp_path = config_dir.join("config.toml.tmp");
+        std::fs::write(&tmp_path, "max_visible = 3\n").unwrap();
+        std::fs::rename(&tmp_path, &config_path).unwrap();
+
+        let result = async_io::block_on(async {
+            use futures_lite::future;
+            let recv = async { rx.recv().await.ok() };
+            let timeout = async {
+                async_io::Timer::after(Duration::from_secs(2)).await;
+                None
+            };
+            future::or(recv, timeout).await
+        });
+
+        let event = result.expect("expected a ConfigEvent but timed out");
+        assert_eq!(event.0.max_visible, 3);
     }
 
     #[test]
