@@ -54,7 +54,7 @@ pub struct CoreHandles {
 // ── Internal state ────────────────────────────────────────────────────────────
 
 struct ActiveNotification {
-    n: Notification,
+    n: Arc<Notification>,
     /// Absolute expiry instant, or `None` if the notification never expires.
     deadline: Option<Instant>,
     /// When the notification is hovered: the remaining time at the moment the
@@ -96,23 +96,7 @@ impl<C: Clock> Core<C> {
 
     fn assign_id(&mut self, n: Box<NewNotification>) -> Notification {
         let id = self.next_fresh_id();
-        Notification {
-            id,
-            app_name: n.app_name,
-            app_icon: n.app_icon,
-            summary: n.summary,
-            body: n.body,
-            actions: n.actions,
-            urgency: n.urgency,
-            expire_timeout: n.expire_timeout,
-            image: n.image,
-            transient: n.transient,
-            resident: n.resident,
-            category: n.category,
-            desktop_entry: n.desktop_entry,
-            created_at: std::time::SystemTime::now(),
-            raw_hints: n.raw_hints,
-        }
+        Notification::from_new(*n, id, std::time::SystemTime::now())
     }
 
     fn next_fresh_id(&mut self) -> u32 {
@@ -180,23 +164,11 @@ impl<C: Clock> Core<C> {
         // Replace in active if replaces_id is found there.
         if replaces_id != 0 {
             if let Some(pos) = self.active.iter().position(|a| a.n.id == replaces_id) {
-                let notification = Notification {
-                    id: replaces_id,
-                    app_name: n.app_name,
-                    app_icon: n.app_icon,
-                    summary: n.summary,
-                    body: n.body,
-                    actions: n.actions,
-                    urgency: n.urgency,
-                    expire_timeout: n.expire_timeout,
-                    image: n.image,
-                    transient: n.transient,
-                    resident: n.resident,
-                    category: n.category,
-                    desktop_entry: n.desktop_entry,
-                    created_at: std::time::SystemTime::now(),
-                    raw_hints: n.raw_hints,
-                };
+                let notification = Arc::new(Notification::from_new(
+                    *n,
+                    replaces_id,
+                    std::time::SystemTime::now(),
+                ));
                 let deadline = self.compute_deadline(&notification, now);
                 if let Some(entry) = self.active.get_mut(pos) {
                     entry.n = notification;
@@ -209,23 +181,8 @@ impl<C: Clock> Core<C> {
 
             // Replace in waiting queue.
             if let Some(pos) = self.waiting.iter().position(|w| w.id == replaces_id) {
-                let notification = Notification {
-                    id: replaces_id,
-                    app_name: n.app_name,
-                    app_icon: n.app_icon,
-                    summary: n.summary,
-                    body: n.body,
-                    actions: n.actions,
-                    urgency: n.urgency,
-                    expire_timeout: n.expire_timeout,
-                    image: n.image,
-                    transient: n.transient,
-                    resident: n.resident,
-                    category: n.category,
-                    desktop_entry: n.desktop_entry,
-                    created_at: std::time::SystemTime::now(),
-                    raw_hints: n.raw_hints,
-                };
+                let notification =
+                    Notification::from_new(*n, replaces_id, std::time::SystemTime::now());
                 if let Some(slot) = self.waiting.get_mut(pos) {
                     *slot = notification;
                 }
@@ -242,7 +199,7 @@ impl<C: Clock> Core<C> {
             self.active.insert(
                 0,
                 ActiveNotification {
-                    n: notification,
+                    n: Arc::new(notification),
                     deadline,
                     paused: None,
                     hovered: false,
@@ -292,7 +249,7 @@ impl<C: Clock> Core<C> {
                     raw_hints: Default::default(),
                 }
             });
-            self.add_to_history(n);
+            self.add_to_history(Arc::new(n));
             return vec![DbusSignal::NotificationClosed {
                 id,
                 reason: CloseReason::CloseCall,
@@ -415,7 +372,10 @@ impl<C: Clock> Core<C> {
         while self.active.len() > new_max_visible {
             // active[0] is the newest; send it back to front of waiting.
             let entry = self.active.remove(0);
-            self.waiting.push_front(entry.n);
+            // Arc::try_unwrap to avoid a clone when there's only one reference;
+            // fall back to (*n).clone() if the Arc is shared.
+            let n = Arc::try_unwrap(entry.n).unwrap_or_else(|arc| (*arc).clone());
+            self.waiting.push_front(n);
         }
 
         // Promote from waiting if max_visible grew.
@@ -506,15 +466,17 @@ impl<C: Clock> Core<C> {
 
     // ── History helpers ───────────────────────────────────────────────────────
 
-    fn add_to_history(&mut self, mut n: Notification) {
+    fn add_to_history(&mut self, n: Arc<Notification>) {
         if n.transient {
             return;
         }
+        // Clone the inner value so we can mutate (strip large image data).
+        let mut owned = (*n).clone();
         // Strip raw image data — it can be large and is not needed in history.
-        if matches!(n.image, Some(ImageSource::Data(_))) {
-            n.image = None;
+        if matches!(owned.image, Some(ImageSource::Data(_))) {
+            owned.image = None;
         }
-        self.history.push_back(n);
+        self.history.push_back(owned);
         while self.history.len() > self.config.history_limit {
             self.history.pop_front();
         }
@@ -529,7 +491,7 @@ impl<C: Clock> Core<C> {
                     let deadline = self.compute_deadline(&n, now);
                     // Promoted notifications are older; push to the end (lowest prominence).
                     self.active.push(ActiveNotification {
-                        n,
+                        n: Arc::new(n),
                         deadline,
                         paused: None,
                         hovered: false,

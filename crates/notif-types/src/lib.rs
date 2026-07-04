@@ -135,6 +135,33 @@ pub struct Notification {
     pub raw_hints: HashMap<String, OwnedValue>,
 }
 
+impl Notification {
+    /// Build a [`Notification`] from a [`NewNotification`], assigning `id` and
+    /// recording `created_at`.
+    ///
+    /// The caller supplies `created_at` (typically `std::time::SystemTime::now()`)
+    /// so that `notif-types` remains free of I/O-ish calls.
+    pub fn from_new(n: NewNotification, id: u32, created_at: std::time::SystemTime) -> Self {
+        Self {
+            id,
+            app_name: n.app_name,
+            app_icon: n.app_icon,
+            summary: n.summary,
+            body: n.body,
+            actions: n.actions,
+            urgency: n.urgency,
+            expire_timeout: n.expire_timeout,
+            image: n.image,
+            transient: n.transient,
+            resident: n.resident,
+            category: n.category,
+            desktop_entry: n.desktop_entry,
+            created_at,
+            raw_hints: n.raw_hints,
+        }
+    }
+}
+
 /// Pre-ID form produced by the D-Bus layer before Core assigns an ID.
 #[derive(Debug, Clone)]
 pub struct NewNotification {
@@ -190,7 +217,7 @@ impl From<CloseReason> for u32 {
 #[derive(Debug, Clone)]
 pub struct DisplayNotification {
     /// The underlying notification data.
-    pub notification: Notification,
+    pub notification: Arc<Notification>,
     /// Whether the pointer is currently hovering over this notification.
     pub hovered: bool,
 }
@@ -199,7 +226,7 @@ impl DisplayNotification {
     /// Create a new `DisplayNotification` with hover cleared.
     pub fn new(notification: Notification) -> Self {
         Self {
-            notification,
+            notification: Arc::new(notification),
             hovered: false,
         }
     }

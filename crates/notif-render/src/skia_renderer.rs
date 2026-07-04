@@ -187,6 +187,23 @@ pub fn parse_markup(input: &str) -> Vec<Span> {
     spans
 }
 
+// ── Alpha premultiplication helper ────────────────────────────────────────────
+
+/// Premultiply straight-alpha RGBA channels into premultiplied RGBA, matching
+/// the `+127` rounding convention used throughout this crate.
+///
+/// Returns `[pre_r, pre_g, pre_b, a]` — identical to the inline math that
+/// existed at `raw_image_to_pixmap` and `load_raster_image` before they were
+/// unified here.
+#[inline]
+fn premultiply_rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
+    let scale = a as u32;
+    let pre_r = ((r as u32 * scale + 127) / 255) as u8;
+    let pre_g = ((g as u32 * scale + 127) / 255) as u8;
+    let pre_b = ((b as u32 * scale + 127) / 255) as u8;
+    [pre_r, pre_g, pre_b, a]
+}
+
 // ── Icon cache key ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,16 +216,18 @@ enum CacheKey {
 
 // ── Per-notification geometry (buffer pixels) ─────────────────────────────────
 
-/// Geometry of a single action button (buffer pixels).
+/// Geometry of a single action button (buffer pixels) with its shaped label buffer.
 struct ButtonGeometry {
     rect: Rect,
     key: String,
-    label: String,
+    /// Pre-shaped cosmic-text buffer for the label (shaped once, reused across renders).
+    label_buffer: Buffer,
 }
 
 /// Full per-notification geometry in buffer-pixel space, including the
 /// (possibly ellipsis-clamped) text spans so `measure` and `render` always
-/// agree on content.
+/// agree on content.  Shaped [`Buffer`]s are stored here so that
+/// `render_spans_into` never needs to re-shape text.
 struct NotifGeometry {
     /// Whole-notification rect.
     body: Rect,
@@ -218,12 +237,56 @@ struct NotifGeometry {
     actions: Vec<ButtonGeometry>,
     /// Height of the action row (0 if no action buttons), buffer px.
     action_row_h: f32,
-    /// Summary spans (bold), clamped to two lines.
-    summary_spans: Vec<Span>,
+    /// Pre-shaped buffer for the summary text.
+    summary_buffer: Buffer,
     /// Measured summary height, buffer px.
     summary_h: f32,
     /// Body spans, markup-parsed and ellipsis-clamped to the available height.
     body_spans: Vec<Span>,
+    /// Pre-shaped buffer for the body text (empty spans → dummy buffer that produces no runs).
+    body_buffer: Buffer,
+}
+
+// ── Frame cache ───────────────────────────────────────────────────────────────
+
+/// Identifies the content that affects layout/rendering.
+/// Hover state is intentionally excluded so that hover-only redraws are cache hits.
+#[derive(PartialEq)]
+struct FrameCacheKey {
+    /// Per-item fingerprints (id, text, urgency, actions, image identity).
+    items: Vec<ItemKey>,
+    /// Scale factor bits (f64::to_bits for exact comparison).
+    scale_bits: u64,
+    /// Config fingerprint (all layout-affecting fields).
+    config_hash: u64,
+}
+
+/// Per-notification fingerprint.
+#[derive(PartialEq, Eq)]
+struct ItemKey {
+    id: u32,
+    summary: String,
+    body: String,
+    urgency: notif_types::Urgency,
+    /// Action key+label pairs (excluding "default").
+    actions: Vec<(String, String)>,
+    /// Image identity: None, Some(Path(…)), Some(Icon(…)), or Some(Data) (all raw images are equal).
+    image_id: ImageId,
+    app_icon: String,
+}
+
+#[derive(PartialEq, Eq)]
+enum ImageId {
+    None,
+    Data,
+    Path(String),
+    Icon(String),
+}
+
+/// A cached rendered frame — geometries (including shaped text buffers) for all items.
+struct CachedFrame {
+    key: FrameCacheKey,
+    geometries: Vec<NotifGeometry>,
 }
 
 // ── Text shaping helpers (free functions to allow split borrows) ──────────────
@@ -252,6 +315,26 @@ fn attrs_for<'a>(span: &Span, family: Family<'a>) -> Attrs<'a> {
     attrs
 }
 
+// ── Test-only shape-invocation counter ───────────────────────────────────────
+
+// Thread-local count of `shape_spans` calls; only active under `#[cfg(test)]`.
+#[cfg(test)]
+thread_local! {
+    static SHAPE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the thread-local shape counter to zero.
+#[cfg(test)]
+pub fn reset_shape_count() {
+    SHAPE_COUNT.with(|c| c.set(0));
+}
+
+/// Return the current thread-local shape-invocation count.
+#[cfg(test)]
+pub fn get_shape_count() -> u32 {
+    SHAPE_COUNT.with(|c| c.get())
+}
+
 /// Shape `spans` at `font_size` constrained to `max_width`; returns the shaped
 /// [`Buffer`] plus `(line_count, total_height)`.
 fn shape_spans(
@@ -261,6 +344,8 @@ fn shape_spans(
     font_size: f32,
     max_width: f32,
 ) -> (Buffer, usize, f32) {
+    #[cfg(test)]
+    SHAPE_COUNT.with(|c| c.set(c.get() + 1));
     let line_height = (font_size * 1.3).ceil();
     let metrics = Metrics::new(font_size, line_height);
     let mut buffer = Buffer::new(font_system, metrics);
@@ -287,7 +372,10 @@ fn shape_spans(
 
 /// Truncate `spans` so the shaped text fits within `max_lines` at `max_width`,
 /// appending an ellipsis when content was dropped.  Returns the (possibly
-/// clamped) spans and their shaped height.
+/// clamped) spans, their shaped height, and the final shaped [`Buffer`].
+///
+/// The returned [`Buffer`] is the definitive shaped form of the returned spans and
+/// should be used directly for rendering to avoid redundant shaping.
 pub fn clamp_spans_to_lines(
     font_system: &mut FontSystem,
     spans: &[Span],
@@ -295,11 +383,11 @@ pub fn clamp_spans_to_lines(
     font_size: f32,
     max_width: f32,
     max_lines: usize,
-) -> (Vec<Span>, f32) {
+) -> (Vec<Span>, f32, Buffer) {
     let max_lines = max_lines.max(1);
-    let (_, lines, height) = shape_spans(font_system, spans, family, font_size, max_width);
+    let (buf, lines, height) = shape_spans(font_system, spans, family, font_size, max_width);
     if lines <= max_lines {
-        return (spans.to_vec(), height);
+        return (spans.to_vec(), height, buf);
     }
 
     let total_chars: usize = spans.iter().map(|sp| sp.text.chars().count()).sum();
@@ -337,13 +425,13 @@ pub fn clamp_spans_to_lines(
     // Binary-search the largest character budget that fits.
     let mut lo = 0usize;
     let mut hi = total_chars;
-    let mut best: Option<(Vec<Span>, f32)> = None;
+    let mut best: Option<(Vec<Span>, f32, Buffer)> = None;
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let candidate = truncate(mid);
-        let (_, lines, h) = shape_spans(font_system, &candidate, family, font_size, max_width);
+        let (buf, lines, h) = shape_spans(font_system, &candidate, family, font_size, max_width);
         if lines <= max_lines {
-            best = Some((candidate, h));
+            best = Some((candidate, h, buf));
             lo = mid;
         } else {
             hi = mid - 1;
@@ -351,7 +439,9 @@ pub fn clamp_spans_to_lines(
     }
     best.unwrap_or_else(|| {
         let line_height = (font_size * 1.3).ceil();
-        (vec![Span::plain("…")], line_height)
+        let fallback = vec![Span::plain("…")];
+        let (fb, _, fh) = shape_spans(font_system, &fallback, family, font_size, max_width);
+        (fallback, fh.max(line_height), fb)
     })
 }
 
@@ -365,6 +455,8 @@ pub struct SkiaRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     icon_cache: HashMap<CacheKey, Option<Pixmap>>,
+    /// One-slot frame cache: geometry + shaped text buffers for the last measured/rendered set.
+    frame_cache: Option<CachedFrame>,
 }
 
 impl SkiaRenderer {
@@ -374,6 +466,7 @@ impl SkiaRenderer {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
             icon_cache: HashMap::new(),
+            frame_cache: None,
         }
     }
 
@@ -394,12 +487,55 @@ impl SkiaRenderer {
             font_system,
             swash_cache: SwashCache::new(),
             icon_cache: HashMap::new(),
+            frame_cache: None,
         }
     }
 
     /// Mutable access to the font system (used by shaping tests).
     pub fn font_system_mut(&mut self) -> &mut FontSystem {
         &mut self.font_system
+    }
+
+    /// Build a [`FrameCacheKey`] from the current items, scale, and config.
+    fn make_cache_key(items: &[DisplayNotification], scale: f64, cfg: &Config) -> FrameCacheKey {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        cfg.hash(&mut hasher);
+        let config_hash = hasher.finish();
+
+        let item_keys = items
+            .iter()
+            .map(|item| {
+                let n = &item.notification;
+                ItemKey {
+                    id: n.id,
+                    summary: n.summary.clone(),
+                    body: n.body.clone(),
+                    urgency: n.urgency,
+                    actions: n
+                        .actions
+                        .iter()
+                        .filter(|a| a.key != "default")
+                        .map(|a| (a.key.clone(), a.label.clone()))
+                        .collect(),
+                    image_id: match &n.image {
+                        None => ImageId::None,
+                        Some(ImageSource::Data(_)) => ImageId::Data,
+                        Some(ImageSource::Path(p)) => ImageId::Path(p.clone()),
+                        Some(ImageSource::Icon(name)) => ImageId::Icon(name.clone()),
+                    },
+                    app_icon: n.app_icon.clone(),
+                }
+            })
+            .collect();
+
+        FrameCacheKey {
+            items: item_keys,
+            scale_bits: scale.to_bits(),
+            config_hash,
+        }
     }
 
     /// Convert a raw `image-data` hint image into a premultiplied RGBA pixmap,
@@ -428,12 +564,8 @@ impl SkiaRenderer {
                     255
                 };
                 let dst_idx = (row * w + col) as usize * 4;
-                let scale = a as u32;
-                let pre_r = ((r as u32 * scale + 127) / 255) as u8;
-                let pre_g = ((g as u32 * scale + 127) / 255) as u8;
-                let pre_b = ((b as u32 * scale + 127) / 255) as u8;
                 if let Some(px) = data.get_mut(dst_idx..dst_idx + 4) {
-                    px.copy_from_slice(&[pre_r, pre_g, pre_b, a]);
+                    px.copy_from_slice(&premultiply_rgba(r, g, b, a));
                 }
             }
         }
@@ -481,12 +613,8 @@ impl SkiaRenderer {
         for (i, pixel) in rgba.pixels().enumerate() {
             let [r, g, b, a] = pixel.0;
             let dst = i * 4;
-            let scale = a as u32;
-            let pre_r = ((r as u32 * scale + 127) / 255) as u8;
-            let pre_g = ((g as u32 * scale + 127) / 255) as u8;
-            let pre_b = ((b as u32 * scale + 127) / 255) as u8;
             if let Some(px) = data.get_mut(dst..dst + 4) {
-                px.copy_from_slice(&[pre_r, pre_g, pre_b, a]);
+                px.copy_from_slice(&premultiply_rgba(r, g, b, a));
             }
         }
         Some(pixmap)
@@ -663,27 +791,28 @@ impl SkiaRenderer {
         }
     }
 
-    /// Render styled spans into `pixmap` at position `(text_x, text_y)`,
+    /// Render a pre-shaped [`Buffer`] into `pixmap` at position `(text_x, text_y)`,
     /// clipping below `clip_bottom` (absolute buffer y).
+    ///
+    /// The buffer must already be shaped (e.g. produced by [`compute_geometry`]);
+    /// this function never calls `shape_spans`.
     #[allow(clippy::too_many_arguments)]
     fn render_spans_into(
         pixmap: &mut Pixmap,
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
-        spans: &[Span],
-        family: Family<'_>,
+        buffer: &Buffer,
         text_x: f32,
         text_y: f32,
-        max_width: f32,
         clip_bottom: f32,
         font_size: f32,
         fg: Rgba,
     ) {
-        if spans.iter().all(|sp| sp.text.is_empty()) || max_width <= 0.0 {
+        // Guard: if the buffer has no width set, there is nothing to render.
+        let max_width = buffer.size().0.unwrap_or(0.0);
+        if max_width <= 0.0 {
             return;
         }
-
-        let (buffer, _, _) = shape_spans(font_system, spans, family, font_size, max_width);
 
         let pix_w = pixmap.width() as i32;
         let pix_h = pixmap.height() as i32;
@@ -819,30 +948,10 @@ impl SkiaRenderer {
         }
     }
 
-    /// Measure the natural single-line width (buffer px) of `text`.
-    fn measure_text_width_with(
-        font_system: &mut FontSystem,
-        text: &str,
-        family: Family<'_>,
-        font_size: f32,
-    ) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        let spans = [Span::plain(text)];
-        let (buffer, _, _) = shape_spans(font_system, &spans, family, font_size, 100_000.0);
-        let mut max_w: f32 = 0.0;
-        for run in buffer.layout_runs() {
-            if run.line_w > max_w {
-                max_w = run.line_w;
-            }
-        }
-        max_w
-    }
-
     /// Compute the full geometry of one notification in **buffer pixels**,
-    /// anchored at buffer-pixel `y`.  Used identically by `measure` and `render`
-    /// so hit regions, text content, and drawing always agree.
+    /// anchored at buffer-pixel `y`.  Shapes each text region exactly once and
+    /// stores the resulting [`Buffer`]s in [`NotifGeometry`] for direct reuse
+    /// by `render_spans_into`.
     fn compute_geometry(
         font_system: &mut FontSystem,
         item: &DisplayNotification,
@@ -866,14 +975,14 @@ impl SkiaRenderer {
 
         let max_h_buf = (cfg.max_height as f64 * scale) as f32;
 
-        // Summary: bold, clamped to two lines.
+        // Summary: bold, clamped to two lines.  Shaping #1 (per item).
         let summary_src = vec![Span {
             text: item.notification.summary.clone(),
             bold: true,
             italic: false,
             underline: false,
         }];
-        let (summary_spans, summary_h) = clamp_spans_to_lines(
+        let (_summary_spans, summary_h, summary_buffer) = clamp_spans_to_lines(
             font_system,
             &summary_src,
             family,
@@ -911,11 +1020,19 @@ impl SkiaRenderer {
         };
 
         // Clamp the body to the height remaining below the summary.
+        // Shaping #2 (per item, only when body is non-empty).
         let body_gap = if body_is_empty { 0.0 } else { padding * 0.3 };
         let body_avail = max_h_buf - padding * 2.0 - summary_h - body_gap - action_row_h;
         let max_body_lines = ((body_avail / line_h).floor() as usize).max(1);
-        let (body_spans, body_h) = if body_is_empty {
-            (Vec::new(), 0.0)
+        let (body_spans, body_h, body_buffer) = if body_is_empty {
+            // No body text — produce a dummy shaped buffer that emits no runs.
+            let dummy = {
+                let metrics = Metrics::new(font_size, line_h);
+                let mut b = Buffer::new(font_system, metrics);
+                b.set_size(Some(text_w.max(1.0)), None);
+                b
+            };
+            (Vec::new(), 0.0, dummy)
         } else {
             clamp_spans_to_lines(
                 font_system,
@@ -955,7 +1072,17 @@ impl SkiaRenderer {
             let btn_y = y + total_h as i32 - (padding + btn_h) as i32;
             let mut bx = padding as i32;
             for (key, label) in action_labels {
-                let label_w = Self::measure_text_width_with(font_system, label, family, font_size);
+                // Shape once to get both the width and the buffer.
+                // Shaping #3+ (per action button, per item).
+                let label_spans = [Span::plain(label)];
+                let (label_buf, _, _) =
+                    shape_spans(font_system, &label_spans, family, font_size, 100_000.0);
+                let mut label_w = 0.0f32;
+                for run in label_buf.layout_runs() {
+                    if run.line_w > label_w {
+                        label_w = run.line_w;
+                    }
+                }
                 // Generous slack so shaping-width rounding never wraps the label.
                 let btn_w = (label_w.ceil() + padding * 1.5).max(btn_h) as u32;
                 if bx + btn_w as i32 > bw as i32 - padding as i32 {
@@ -969,7 +1096,7 @@ impl SkiaRenderer {
                         height: btn_h as u32,
                     },
                     key: key.to_owned(),
-                    label: label.to_owned(),
+                    label_buffer: label_buf,
                 });
                 bx += btn_w as i32 + btn_gap as i32;
             }
@@ -980,9 +1107,10 @@ impl SkiaRenderer {
             close: close_rect,
             actions,
             action_row_h,
-            summary_spans,
+            summary_buffer,
             summary_h,
             body_spans,
+            body_buffer,
         }
     }
 
@@ -1043,7 +1171,6 @@ impl SkiaRenderer {
         let y = geo.body.y as f32;
         let w = geo.body.width as f32;
         let h = geo.body.height as f32;
-        let family = family_of(cfg);
 
         let body_hovered = hover.is_some_and(|t| *t == HitTarget::Body(id));
 
@@ -1112,37 +1239,31 @@ impl SkiaRenderer {
         }
 
         let text_x = x + padding + icon_x_offset;
-        let text_w = (w - padding - icon_x_offset - padding).max(10.0);
-        let summary_w = (text_w - CLOSE_SIZE * s - CLOSE_INSET * s).max(40.0);
         let clip_bottom = y + h - padding - geo.action_row_h;
 
-        // Summary (bold, slightly larger).
+        // Summary (bold, slightly larger) — use the pre-shaped buffer from the cache.
         Self::render_spans_into(
             pixmap,
             &mut self.font_system,
             &mut self.swash_cache,
-            &geo.summary_spans,
-            family,
+            &geo.summary_buffer,
             text_x,
             y + padding,
-            summary_w,
             clip_bottom,
             font_size * 1.1,
             fg,
         );
 
-        // Body below the summary (markup-styled, ellipsis-clamped).
+        // Body below the summary (markup-styled, ellipsis-clamped) — cached buffer.
         if !geo.body_spans.is_empty() {
             let body_y = y + padding + geo.summary_h + padding * 0.3;
             Self::render_spans_into(
                 pixmap,
                 &mut self.font_system,
                 &mut self.swash_cache,
-                &geo.body_spans,
-                family,
+                &geo.body_buffer,
                 text_x,
                 body_y,
-                text_w,
                 clip_bottom,
                 font_size,
                 fg,
@@ -1153,7 +1274,7 @@ impl SkiaRenderer {
         let close_hovered = hover.is_some_and(|t| *t == HitTarget::CloseButton(id));
         Self::draw_close_button(pixmap, &geo.close, scale, fg, close_hovered);
 
-        // Action buttons.
+        // Action buttons — use pre-shaped label buffers from the cache.
         for btn in &geo.actions {
             let btn_hovered = hover.is_some_and(|t| {
                 matches!(t, HitTarget::ActionButton { id: hid, key } if *hid == id && *key == btn.key)
@@ -1172,19 +1293,16 @@ impl SkiaRenderer {
             let bh2 = btn.rect.height as f32;
             Self::fill_rounded_rect(pixmap, bx, by, bw2, bh2, 4.0 * s, btn_bg);
 
-            // Center-ish the label.
+            // Center-ish the label using the pre-shaped buffer.
             let line_h = (font_size * 1.3).ceil();
             let label_y = by + ((bh2 - line_h) * 0.5).max(0.0);
-            let label_spans = [Span::plain(btn.label.clone())];
             Self::render_spans_into(
                 pixmap,
                 &mut self.font_system,
                 &mut self.swash_cache,
-                &label_spans,
-                family,
+                &btn.label_buffer,
                 bx + padding * 0.5,
                 label_y,
-                (bw2 - padding * 0.5).max(4.0),
                 by + bh2,
                 font_size,
                 fg,
@@ -1202,6 +1320,8 @@ impl Default for SkiaRenderer {
 impl Renderer for SkiaRenderer {
     fn measure(&mut self, items: &[DisplayNotification], cfg: &Config, scale: f64) -> Layout {
         if items.is_empty() {
+            // Clear cache on empty so a stale entry never blocks a fresh non-empty call.
+            self.frame_cache = None;
             return Layout {
                 width: 0,
                 height: 0,
@@ -1209,13 +1329,36 @@ impl Renderer for SkiaRenderer {
             };
         }
 
+        let new_key = Self::make_cache_key(items, scale, cfg);
+
+        // Populate the frame cache on a miss.
+        if self.frame_cache.as_ref().is_none_or(|c| c.key != new_key) {
+            let gap_buf = (cfg.gap as f64 * scale).round() as i32;
+            let mut y_cursor = 0i32;
+            let mut geometries = Vec::with_capacity(items.len());
+            for item in items {
+                let geo = Self::compute_geometry(&mut self.font_system, item, cfg, scale, y_cursor);
+                y_cursor += geo.body.height as i32 + gap_buf;
+                geometries.push(geo);
+            }
+            self.frame_cache = Some(CachedFrame {
+                key: new_key,
+                geometries,
+            });
+        }
+
+        // Build hit_regions from the cached geometries.
         let gap_buf = (cfg.gap as f64 * scale).round() as i32;
+        // frame_cache is guaranteed Some by the block above; zip stops early if sizes mismatch.
+        let geo_iter: &[NotifGeometry] = self
+            .frame_cache
+            .as_ref()
+            .map_or(&[], |c| c.geometries.as_slice());
         let mut hit_regions = Vec::new();
         let mut y_cursor = 0i32;
 
-        for item in items {
+        for (item, geo) in items.iter().zip(geo_iter.iter()) {
             let id = item.notification.id;
-            let geo = Self::compute_geometry(&mut self.font_system, item, cfg, scale, y_cursor);
 
             // notif-wl hit-tests with `.find()`, so push the more specific
             // targets (close, action buttons) before the whole-body region.
@@ -1279,16 +1422,42 @@ impl Renderer for SkiaRenderer {
             None => return,
         };
 
-        // Recompute per-notification geometry exactly as measure() does so the
-        // drawing agrees with the published hit regions.
+        // Use the frame cache (filled by measure); recompute only on a miss
+        // (e.g. render called without a preceding measure for these items).
+        let new_key = Self::make_cache_key(items, scale, cfg);
+        if self.frame_cache.as_ref().is_none_or(|c| c.key != new_key) {
+            let gap_buf = (cfg.gap as f64 * scale).round() as i32;
+            let mut y_cursor = 0i32;
+            let mut geometries = Vec::with_capacity(items.len());
+            for item in items {
+                let geo = Self::compute_geometry(&mut self.font_system, item, cfg, scale, y_cursor);
+                y_cursor += geo.body.height as i32 + gap_buf;
+                geometries.push(geo);
+            }
+            self.frame_cache = Some(CachedFrame {
+                key: new_key,
+                geometries,
+            });
+        }
+
+        // Render each notification using the cached geometries.
+        // Borrow the geometries slice before calling render_notification (which
+        // takes &mut self) by temporarily taking the frame_cache out.
+        // We put it back immediately after.
+        // frame_cache guaranteed Some by the block above.
+        let Some(cached) = self.frame_cache.take() else {
+            return;
+        };
         let gap_buf = (cfg.gap as f64 * scale).round() as i32;
         let mut y_cursor = 0i32;
-
-        for item in items {
-            let geo = Self::compute_geometry(&mut self.font_system, item, cfg, scale, y_cursor);
-            self.render_notification(&mut pixmap, item, cfg, scale, &geo, hover);
+        for (item, geo) in items.iter().zip(cached.geometries.iter()) {
+            // Reattach the y-offset: the cache stores geometry with the y
+            // from the original compute pass; re-use directly.
+            self.render_notification(&mut pixmap, item, cfg, scale, geo, hover);
             y_cursor += geo.body.height as i32 + gap_buf;
         }
+        let _ = y_cursor;
+        self.frame_cache = Some(cached);
 
         // Copy RGBA pixmap → BGRA output buffer (wl_shm ARGB8888 little-endian).
         // This is the single swizzle point for the whole crate.
@@ -1424,7 +1593,7 @@ mod tests {
         let family = Family::Name("DejaVu Sans");
         let long = "word ".repeat(200);
         let spans = vec![Span::plain(long)];
-        let (clamped, height) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 3);
+        let (clamped, height, _buf) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 3);
         let joined: String = clamped.iter().map(|s| s.text.as_str()).collect();
         assert!(joined.ends_with('…'), "clamped text must end with ellipsis");
         assert!(joined.len() < 500, "text must actually be truncated");
@@ -1439,7 +1608,7 @@ mod tests {
         let mut fs = test_font_system();
         let family = Family::Name("DejaVu Sans");
         let spans = vec![Span::plain("short")];
-        let (clamped, _) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 3);
+        let (clamped, _, _buf) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 3);
         assert_eq!(clamped, spans, "short text must pass through unchanged");
     }
 
@@ -1456,7 +1625,7 @@ mod tests {
             },
             Span::plain("plain ".repeat(100)),
         ];
-        let (clamped, _) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 2);
+        let (clamped, _, _buf) = clamp_spans_to_lines(&mut fs, &spans, family, 13.0, 300.0, 2);
         assert!(!clamped.is_empty());
         assert!(clamped[0].bold, "first span keeps its bold style");
     }
@@ -1479,5 +1648,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Frame cache / shape-deduplication regression test ─────────────────────
+
+    /// Helper: build a `DisplayNotification` suitable for shape-count testing.
+    fn make_test_dn(id: u32) -> notif_types::DisplayNotification {
+        use notif_types::{Action, Notification, Timeout, Urgency};
+        use std::{collections::HashMap, time::SystemTime};
+
+        notif_types::DisplayNotification::new(Notification {
+            id,
+            app_name: "test".into(),
+            app_icon: String::new(),
+            summary: "Shape-count summary".into(),
+            body: "Shape-count body text".into(),
+            actions: vec![Action {
+                key: "ok".into(),
+                label: "OK".into(),
+            }],
+            urgency: Urgency::Normal,
+            expire_timeout: Timeout::Default,
+            image: None,
+            transient: false,
+            resident: false,
+            category: None,
+            desktop_entry: None,
+            created_at: SystemTime::UNIX_EPOCH,
+            raw_hints: HashMap::new(),
+        })
+    }
+
+    /// `measure()` + `render()` + `render(different hover)` on the same items
+    /// must shape each text region exactly once (cache fills on measure, both
+    /// render calls are cache hits and perform zero additional shaping).
+    #[test]
+    fn shape_count_regression() {
+        use crate::HitTarget;
+        use notif_types::config::Config;
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fonts");
+        let paths = vec![dir.join("DejaVuSans.ttf"), dir.join("DejaVuSans-Bold.ttf")];
+        let mut renderer = SkiaRenderer::with_font_files(&paths);
+        let cfg = Config::default();
+        let items = vec![make_test_dn(1), make_test_dn(2)];
+
+        // Reset the shape counter to zero before we start.
+        reset_shape_count();
+        let before = get_shape_count();
+
+        // measure() — must fill the cache.
+        let layout = renderer.measure(&items, &cfg, 1.0);
+
+        let after_measure = get_shape_count();
+        let shapes_in_measure = after_measure - before;
+        // We expect > 0 shapes (summary + body + button per item).
+        assert!(shapes_in_measure > 0, "measure must perform some shaping");
+
+        // render() — must be a cache hit; no new shaping.
+        let buf_w = (layout.width as f64 * 1.0).ceil() as u32;
+        let buf_h = (layout.height as f64 * 1.0).ceil() as u32;
+        let stride = buf_w * 4;
+        let mut buf = vec![0u8; (stride * buf_h) as usize];
+        renderer.render(&mut buf, stride, &layout, &items, &cfg, 1.0, None);
+
+        let after_render1 = get_shape_count();
+        assert_eq!(
+            after_render1, after_measure,
+            "render() on same items must not reshape (cache hit)"
+        );
+
+        // render() again with a different hover — still a cache hit.
+        let hover = HitTarget::CloseButton(1);
+        renderer.render(&mut buf, stride, &layout, &items, &cfg, 1.0, Some(&hover));
+
+        let after_render2 = get_shape_count();
+        assert_eq!(
+            after_render2, after_render1,
+            "render() with different hover must not reshape (hover not part of cache key)"
+        );
     }
 }

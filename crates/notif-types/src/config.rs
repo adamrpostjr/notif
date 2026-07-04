@@ -4,7 +4,9 @@
 //! watching live in `notif-config`.
 
 /// Corner to anchor the notification stack to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorCorner {
     /// Top-left corner.
@@ -19,7 +21,7 @@ pub enum AnchorCorner {
 }
 
 /// RGBA color parsed from `"#rrggbb"` or `"#rrggbbaa"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgba {
     /// Red channel (0–255).
     pub r: u8,
@@ -88,7 +90,7 @@ impl<'de> serde::Deserialize<'de> for Rgba {
 }
 
 /// Per-urgency visual style.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UrgencyStyle {
     /// Background fill color.
     pub background: Rgba,
@@ -201,5 +203,28 @@ impl Default for Config {
             body_markup: true,
             icon_theme: None,
         }
+    }
+}
+
+impl std::hash::Hash for Config {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.anchor.hash(state);
+        self.margin_x.hash(state);
+        self.margin_y.hash(state);
+        self.gap.hash(state);
+        self.max_width.hash(state);
+        self.max_height.hash(state);
+        self.max_visible.hash(state);
+        self.low.hash(state);
+        self.normal.hash(state);
+        self.critical.hash(state);
+        self.font_family.hash(state);
+        // f32 has no Hash impl; use the bit pattern instead.
+        self.font_size.to_bits().hash(state);
+        self.icon_size.hash(state);
+        self.output.hash(state);
+        self.history_limit.hash(state);
+        self.body_markup.hash(state);
+        self.icon_theme.hash(state);
     }
 }

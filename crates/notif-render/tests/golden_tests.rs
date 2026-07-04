@@ -464,7 +464,10 @@ fn raw_image_via_render_does_not_panic() {
         data: vec![0x7f; 64],
     };
     let mut n = make_notif(9, "With image", "body", Urgency::Normal);
-    n.notification.image = Some(ImageSource::Data(raw));
+    // Replace the Arc with one that carries the image (Arc<Notification> is immutable).
+    let mut inner = (*n.notification).clone();
+    inner.image = Some(ImageSource::Data(raw));
+    n.notification = std::sync::Arc::new(inner);
     let mut r = test_renderer();
     let cfg = Config::default();
     let (_, _, rgba) = render_rgba(&mut r, &[n], &cfg, 1.0);
