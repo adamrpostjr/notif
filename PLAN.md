@@ -133,3 +133,64 @@ Order: vocabulary first, then the two headless-testable modules, then Wayland sh
 ## Execution note
 
 On approval, work begins with **Task 1** (workspace scaffold + notif-types + notif-config): I author the tightly scoped prompt from this plan and delegate to a builder agent, then review against the criteria above before moving to Task 2. This plan document also gets committed into the repo as `PLAN.md` so builder agents can be pointed at the frozen contracts.
+
+---
+
+# Phase 2 — IPC, notifctl, Notification Center
+
+Phase 1 delivered the daemon (popups). Phase 2 adds external control and the history panel. Three tasks, same protocol: architect-authored prompts, builder implements, architect reviews against §Review Criteria, one commit per task.
+
+## Phase-2 message vocabulary (notif-types additions — frozen once Task 6 lands)
+
+```rust
+/// Serializable summary of a notification for IPC/history consumers.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub id: u32,
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+    pub urgency: Urgency,
+    pub created_at_unix: u64,   // seconds since epoch (SystemTime is not serde-friendly)
+}
+
+pub struct StatusInfo { pub dnd: bool, pub active: usize, pub waiting: usize, pub history: usize, pub center_visible: bool } // serde too
+
+// IpcCmd REPLACES the Phase-1 placeholder (request/response where needed):
+pub enum IpcCmd {
+    DismissAll,
+    Close { id: u32 },
+    History { reply: ReplyTx<Vec<HistoryEntry>> },
+    ClearHistory,
+    ToggleDnd { reply: ReplyTx<bool> },          // replies with the NEW dnd state
+    ToggleCenter { reply: ReplyTx<bool> },       // replies with the NEW visibility
+    Status { reply: ReplyTx<StatusInfo> },
+}
+
+// UiCommand gains one variant:
+UiCommand::SetCenter { visible: bool, entries: Arc<[DisplayNotification]> }
+// UiEvent gains two:
+UiEvent::HistoryRemoveRequested(u32)   // '×' on a center entry
+UiEvent::ClearHistoryRequested        // 'clear all' button in center
+```
+
+## Core Phase-2 semantics (notif-core)
+
+- **DND**: `dnd: bool` state (starts false). While on: incoming non-Critical notifications are assigned an id, added directly to history (image stripped, transient still excluded), NOT displayed, no signals emitted. Critical notifications bypass DND and display normally. replaces_id targeting a DND-hidden (history) entry → treat as new (spec-safe). ToggleDnd replies with the new state.
+- **History query**: `History` replies with newest-first `Vec<HistoryEntry>` mapped from the ring.
+- **Center**: core tracks `center_visible: bool`. ToggleCenter flips it and (always, plus after any history mutation while visible) pushes `UiCommand::SetCenter { visible, entries }` where entries = history newest-first as stripped DisplayNotifications. `HistoryRemoveRequested(id)` removes from history; `ClearHistoryRequested`/`ClearHistory` empties it; both re-push SetCenter when visible.
+- DismissAll/Close(id) via IPC reuse existing dismiss paths (reason Dismissed).
+
+## Task 6 — notif-ipc socket server + core Phase-2 semantics
+Socket: `$XDG_RUNTIME_DIR/notif.sock` (error if XDG_RUNTIME_DIR unset). Unlink stale socket on bind; unlink on clean shutdown. Protocol: one JSON object per line, request→response:
+`{"cmd":"dismiss-all"}` → `{"ok":true}` · `{"cmd":"close","id":5}` → `{"ok":true}` · `{"cmd":"history"}` → `{"ok":true,"history":[HistoryEntry...]}` · `{"cmd":"clear-history"}` → `{"ok":true}` · `{"cmd":"toggle-dnd"}` → `{"ok":true,"dnd":<new>}` · `{"cmd":"toggle-center"}` → `{"ok":true,"visible":<new>}` · `{"cmd":"status"}` → `{"ok":true,"status":StatusInfo}` · unknown/malformed → `{"ok":false,"error":"..."}` (connection stays open; one request per connection is also fine for the client).
+notif-ipc: `pub async fn run(ipc_tx: Sender<IpcCmd>) -> Result<(), IpcError>` using async-io Async<UnixListener>; sequential accept loop; serde_json (NEW APPROVED DEP: serde_json, workspace-wide). notifd spawns it; wl gains a no-op/log arm for SetCenter (real rendering is Task 8). Tests: protocol unit tests over an in-process socketpair; core unit tests for DND (hidden non-critical, critical bypass), history query mapping, clear/remove.
+
+## Task 7 — notifctl
+bin/notifctl: subcommands `dismiss-all | close <id> | history [--json] | clear-history | dnd | center | status [--json]`. Hand-rolled arg parsing (match on args — no clap; zero-bloat). Connects, sends one JSON line, prints reply human-readably (or raw JSON with --json). Exit 0 on ok:true, 1 on ok:false/connect failure with message to stderr. Smoke script `bin/notifctl/tests/manual/ctl_smoke.sh`: isolated bus, start notifd, notify-send, then notifctl status/history/dismiss-all/dnd round-trips asserting outputs.
+
+## Task 8 — notification-center panel (notif-wl + notif-render)
+Second layer surface, namespace `"notif-center"` (documented for layerrules), same output, Layer::Top, anchored to the configured corner's edge (top+bottom+right for right-side corners → full-height panel), keyboard_interactivity none, fixed logical width `config.center_width` (NEW config field, default 400, validated ≤ 8192). Rendered by the same SkiaRenderer via a new trait method with default impl OR a CenterRenderer wrapper — prefer: extend Renderer with `measure_center`/`render_center` (default impls returning empty so StubRenderer stays valid). Entries: compact rows (summary bold, app_name + relative age line, body one-line ellipsis, per-urgency accent border-left, '×' hit region → HistoryRemoveRequested), header with count + 'Clear all' hit region → ClearHistoryRequested. Empty history → 'No notifications' placeholder. Center surface lifecycle mirrors the toast surface (created on SetCenter{visible:true}, destroyed on false); toasts and center coexist (two SurfaceStates — refactor SurfaceState handling to a small map/two-slot struct). Scale/viewport/hit-test discipline identical to toasts (layout_scale per surface). Golden tests for the center rendering (same bundled fonts); e2e: toggle via notifctl on live Hyprland, grim screenshot, verify panel + entry removal.
+
+## Phase-2 verification
+Full gates per task; after Task 8: live e2e — notify-send ×3, expire, `notifctl center` shows them in the panel, '×' removes one (manual note if un-clickable in test), `notifctl dnd` hides subsequent normal notifications but not critical, `notifctl status --json` sane, SIGTERM clean, goldens stable.
