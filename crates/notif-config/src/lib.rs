@@ -81,6 +81,16 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
             message: format!("max_height must be at most 8192, got {}", c.max_height),
         });
     }
+    if c.center_width == 0 {
+        return Err(ConfigError::Validation {
+            message: "center_width must be at least 1".to_owned(),
+        });
+    }
+    if c.center_width > 8192 {
+        return Err(ConfigError::Validation {
+            message: format!("center_width must be at most 8192, got {}", c.center_width),
+        });
+    }
     Ok(())
 }
 
@@ -207,6 +217,7 @@ mod tests {
             config.critical.default_timeout_ms,
             defaults.critical.default_timeout_ms
         );
+        assert_eq!(config.center_width, defaults.center_width);
     }
 
     #[test]

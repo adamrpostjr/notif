@@ -180,6 +180,10 @@ pub struct Config {
     /// Icon theme name for freedesktop icon lookup.
     #[serde(default)]
     pub icon_theme: Option<String>,
+    /// Width of the notification center panel in logical pixels.
+    ///
+    /// Valid range: 1–8192. Default: 400.
+    pub center_width: u32,
 }
 
 impl Default for Config {
@@ -202,6 +206,7 @@ impl Default for Config {
             history_limit: 100,
             body_markup: true,
             icon_theme: None,
+            center_width: 400,
         }
     }
 }
@@ -226,5 +231,6 @@ impl std::hash::Hash for Config {
         self.history_limit.hash(state);
         self.body_markup.hash(state);
         self.icon_theme.hash(state);
+        self.center_width.hash(state);
     }
 }

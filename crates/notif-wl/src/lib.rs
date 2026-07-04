@@ -4,9 +4,9 @@
 //! `notif-wl` — Wayland layer-shell surface management for the notif daemon.
 //!
 //! Connects to the Wayland compositor using `smithay-client-toolkit` (no calloop),
-//! manages a single `zwlr_layer_shell_v1` surface sized to notification content,
-//! forwards pointer events as `UiEvent`s, and integrates with the smol async
-//! reactor via `async_io::Async`.
+//! manages two `zwlr_layer_shell_v1` surfaces (toasts + notification center) sized
+//! to content, forwards pointer events as `UiEvent`s, and integrates with the smol
+//! async reactor via `async_io::Async`.
 //!
 //! # Layer choice: `Top` not `Overlay`
 //! We use `Layer::Top` rather than `Layer::Overlay`.  `Overlay` sits above lock
@@ -15,12 +15,9 @@
 //! semantic layer.  Compositors may grant `Overlay` to arbitrary clients which is a
 //! security risk; `Top` is universally supported and semantically correct.
 //!
-//! # Namespace: `"notif"`
-//! Stable namespace so Hyprland `layerrule`s can target it:
-//! ```text
-//! layerrule = blur, notif
-//! layerrule = ignorezero, notif
-//! ```
+//! # Namespaces
+//! - Toasts: `"notif"` — stable, targeted by Hyprland `layerrule = blur, notif`.
+//! - Center panel: `"notif-center"` — stable, targeted by `layerrule = blur, notif-center`.
 //!
 //! # Event loop (no calloop)
 //! We own the [`EventQueue`] and drive it manually:
@@ -142,8 +139,8 @@ pub async fn run(
         .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
         .ok();
 
-    // Initial pool size (1 MiB; grows as needed).
-    let pool = SlotPool::new(1024 * 1024, &shm)?;
+    // Initial pool size (2 MiB; grows as needed).
+    let pool = SlotPool::new(2 * 1024 * 1024, &shm)?;
 
     // Wrap the event queue fd in async_io::Async so we can await readability.
     // EventQueue: AsFd; try_clone_to_owned duplicates the fd via dup(2)/F_DUPFD_CLOEXEC
@@ -164,16 +161,38 @@ pub async fn run(
         config,
         renderer,
         ui_event_tx,
-        surface_state: None,
+        toasts: None,
+        center: None,
         pointer: None,
-        current_hover: None,
+        pointer_surface: PointerSurface::None,
+        toast_hover: None,
+        center_hover: None,
         pending_items: Arc::from([]),
+        center_entries: Arc::from([]),
+        center_visible: false,
         pending_redraw: false,
         shutdown: false,
         event_queue: Some(event_queue),
     };
 
     state.event_loop(&async_fd, ui_cmd_rx, &qh).await
+}
+
+// ── Surface role ────────────────────────────────────────────────────────────
+
+/// Which logical role a surface slot plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceRole {
+    Toasts,
+    Center,
+}
+
+/// Which surface the pointer is currently over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerSurface {
+    None,
+    Toasts,
+    Center,
 }
 
 // ── Per-surface state ───────────────────────────────────────────────────────
@@ -199,6 +218,9 @@ struct SurfaceState {
     /// automatically before invoking the handler; we must never ack manually,
     /// and must not attach a buffer before the first configure.
     configured: bool,
+    /// Role of this surface slot (stored for debugging and future use).
+    #[allow(dead_code)]
+    role: SurfaceRole,
 }
 
 // ── Main state struct ───────────────────────────────────────────────────────
@@ -218,14 +240,24 @@ struct WlState {
     renderer: Box<dyn Renderer>,
     ui_event_tx: async_channel::Sender<UiEvent>,
 
-    /// Current layer surface, if any.
-    surface_state: Option<SurfaceState>,
+    /// Toast surface, if any.
+    toasts: Option<SurfaceState>,
+    /// Center panel surface, if any.
+    center: Option<SurfaceState>,
     /// Active pointer object.
     pointer: Option<wl_pointer::WlPointer>,
-    /// Currently hovered hit target.
-    current_hover: Option<HitTarget>,
+    /// Which surface the pointer is currently over.
+    pointer_surface: PointerSurface,
+    /// Currently hovered hit target on the toast surface.
+    toast_hover: Option<HitTarget>,
+    /// Currently hovered hit target on the center surface.
+    center_hover: Option<HitTarget>,
     /// Latest set of items from a Sync command.
     pending_items: Arc<[DisplayNotification]>,
+    /// Center panel entries from the most recent SetCenter command.
+    center_entries: Arc<[DisplayNotification]>,
+    /// Whether the center panel is currently supposed to be visible.
+    center_visible: bool,
     /// True when content changed and we should re-measure + re-render.
     pending_redraw: bool,
     /// Set when Shutdown command arrives.
@@ -272,7 +304,8 @@ impl WlState {
             // Apply any pending redraw before waiting.
             if self.pending_redraw {
                 self.pending_redraw = false;
-                self.apply_pending(qh)?;
+                self.apply_pending_toasts(qh)?;
+                self.apply_pending_center(qh)?;
             }
 
             if self.shutdown {
@@ -325,8 +358,9 @@ impl WlState {
             }
         }
 
-        // Clean up surface on exit.
-        self.destroy_surface();
+        // Clean up both surfaces on exit.
+        self.destroy_surface(SurfaceRole::Toasts);
+        self.destroy_surface(SurfaceRole::Center);
         Ok(())
     }
 
@@ -334,73 +368,125 @@ impl WlState {
         match cmd {
             UiCommand::Sync(items) => {
                 self.pending_items = items;
-                self.apply_pending(qh)?;
+                self.apply_pending_toasts(qh)?;
             }
             UiCommand::ConfigChanged(cfg) => {
                 self.config = cfg;
                 if !self.pending_items.is_empty() {
-                    self.apply_pending(qh)?;
+                    self.apply_pending_toasts(qh)?;
+                }
+                if self.center_visible {
+                    self.apply_pending_center(qh)?;
                 }
             }
             UiCommand::Shutdown => {
                 self.shutdown = true;
             }
-            UiCommand::SetCenter { visible, .. } => {
-                // Phase 2 Task 8 (center panel rendering) is not yet implemented.
-                // Log and ignore so the run loop compiles; the real surface
-                // management will be added in Task 8.
-                log::debug!(
-                    "notif-wl: SetCenter(visible={visible}) — center rendering not yet implemented"
-                );
+            UiCommand::SetCenter { visible, entries } => {
+                self.center_entries = entries;
+                self.center_visible = visible;
+                self.apply_pending_center(qh)?;
             }
         }
         Ok(())
     }
 
-    /// Apply the pending items: create/destroy/redraw surface as needed.
-    fn apply_pending(&mut self, qh: &QueueHandle<WlState>) -> Result<(), WlError> {
+    /// Apply pending toasts: create/destroy/redraw toast surface as needed.
+    fn apply_pending_toasts(&mut self, qh: &QueueHandle<WlState>) -> Result<(), WlError> {
         if self.pending_items.is_empty() {
-            self.destroy_surface();
+            self.destroy_surface(SurfaceRole::Toasts);
             return Ok(());
         }
 
-        if self.surface_state.is_none() {
-            self.create_surface(qh)?;
+        if self.toasts.is_none() {
+            self.create_surface(qh, SurfaceRole::Toasts)?;
         } else {
-            self.redraw(qh)?;
+            self.redraw(qh, SurfaceRole::Toasts)?;
         }
         Ok(())
     }
 
-    fn create_surface(&mut self, qh: &QueueHandle<WlState>) -> Result<(), WlError> {
+    /// Apply pending center: create/destroy/redraw center surface as needed.
+    fn apply_pending_center(&mut self, qh: &QueueHandle<WlState>) -> Result<(), WlError> {
+        if !self.center_visible {
+            self.destroy_surface(SurfaceRole::Center);
+            return Ok(());
+        }
+
+        if self.center.is_none() {
+            self.create_surface(qh, SurfaceRole::Center)?;
+        } else {
+            self.redraw(qh, SurfaceRole::Center)?;
+        }
+        Ok(())
+    }
+
+    fn create_surface(
+        &mut self,
+        qh: &QueueHandle<WlState>,
+        role: SurfaceRole,
+    ) -> Result<(), WlError> {
         let wl_surface = self.compositor.create_surface(qh);
 
         let output = self.find_output();
+
+        let namespace = match role {
+            SurfaceRole::Toasts => "notif",
+            SurfaceRole::Center => "notif-center",
+        };
 
         let layer = self.layer_shell.create_layer_surface(
             qh,
             wl_surface.clone(),
             // Layer::Top: above normal windows, below lock screens. (See module doc.)
             Layer::Top,
-            Some("notif"),
+            Some(namespace),
             output.as_ref(),
         );
 
-        let anchor = anchor_for_corner(self.config.anchor);
+        let (anchor, mx, my) = match role {
+            SurfaceRole::Toasts => {
+                let anchor = anchor_for_corner(self.config.anchor);
+                (
+                    anchor,
+                    self.config.margin_x as i32,
+                    self.config.margin_y as i32,
+                )
+            }
+            SurfaceRole::Center => {
+                // Center panel: anchored top+right, full height.
+                // Margins come from config margin_x (right gap) and margin_y (top gap).
+                let anchor = Anchor::TOP | Anchor::RIGHT | Anchor::BOTTOM;
+                (
+                    anchor,
+                    self.config.margin_x as i32,
+                    self.config.margin_y as i32,
+                )
+            }
+        };
+
         layer.set_anchor(anchor);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         // Exclusive zone 0: do not reserve space; do not be displaced by other zones.
         layer.set_exclusive_zone(0);
-        let mx = self.config.margin_x as i32;
-        let my = self.config.margin_y as i32;
         layer.set_margin(my, mx, my, mx);
 
         let scale = 1.0_f64;
-        let layout = self
-            .renderer
-            .measure(&self.pending_items, &self.config, scale);
-        let lw = layout.width;
-        let lh = layout.height;
+
+        let (lw, lh) = match role {
+            SurfaceRole::Toasts => {
+                let layout = self
+                    .renderer
+                    .measure(&self.pending_items, &self.config, scale);
+                (layout.width, layout.height)
+            }
+            SurfaceRole::Center => {
+                let layout =
+                    self.renderer
+                        .measure_center(&self.center_entries, &self.config, scale);
+                (self.config.center_width, layout.height)
+            }
+        };
 
         layer.set_size(lw, lh);
 
@@ -416,7 +502,13 @@ impl WlState {
             .as_ref()
             .map(|vp| vp.get_viewport(&wl_surface, qh, ()));
 
-        self.surface_state = Some(SurfaceState {
+        let layout = Layout {
+            width: lw,
+            height: lh,
+            hit_regions: Vec::new(),
+        };
+
+        let ss = SurfaceState {
             layer,
             viewport,
             frac_scale,
@@ -427,13 +519,23 @@ impl WlState {
             logical_h: lh,
             mapped: false,
             configured: false,
-        });
+            role,
+        };
+
+        match role {
+            SurfaceRole::Toasts => self.toasts = Some(ss),
+            SurfaceRole::Center => self.center = Some(ss),
+        }
 
         Ok(())
     }
 
-    fn destroy_surface(&mut self) {
-        if let Some(ss) = self.surface_state.take() {
+    fn destroy_surface(&mut self, role: SurfaceRole) {
+        let ss = match role {
+            SurfaceRole::Toasts => self.toasts.take(),
+            SurfaceRole::Center => self.center.take(),
+        };
+        if let Some(ss) = ss {
             if let Some(vp) = ss.viewport {
                 vp.destroy();
             }
@@ -442,35 +544,81 @@ impl WlState {
             }
             drop(ss.layer);
         }
-        self.current_hover = None;
+        // Clear hover for this surface.
+        match role {
+            SurfaceRole::Toasts => {
+                self.toast_hover = None;
+                if self.pointer_surface == PointerSurface::Toasts {
+                    self.pointer_surface = PointerSurface::None;
+                }
+            }
+            SurfaceRole::Center => {
+                self.center_hover = None;
+                if self.pointer_surface == PointerSurface::Center {
+                    self.pointer_surface = PointerSurface::None;
+                }
+            }
+        }
     }
 
-    fn redraw(&mut self, qh: &QueueHandle<WlState>) -> Result<(), WlError> {
-        if self.pending_items.is_empty() {
-            self.destroy_surface();
+    fn redraw(&mut self, qh: &QueueHandle<WlState>, role: SurfaceRole) -> Result<(), WlError> {
+        let (items_empty, configured) = match role {
+            SurfaceRole::Toasts => (
+                self.pending_items.is_empty(),
+                self.toasts.as_ref().is_some_and(|s| s.configured),
+            ),
+            SurfaceRole::Center => (
+                !self.center_visible,
+                self.center.as_ref().is_some_and(|s| s.configured),
+            ),
+        };
+
+        if items_empty {
+            self.destroy_surface(role);
             return Ok(());
         }
 
-        let ss = match self.surface_state.as_mut() {
-            Some(s) => s,
-            None => return Ok(()),
+        let ss = match role {
+            SurfaceRole::Toasts => match self.toasts.as_mut() {
+                Some(s) => s,
+                None => return Ok(()),
+            },
+            SurfaceRole::Center => match self.center.as_mut() {
+                Some(s) => s,
+                None => return Ok(()),
+            },
         };
-        if !ss.configured {
+        if !configured {
             // Attaching before the first configure is a protocol error;
             // the configure handler re-enters redraw once it arrives.
             return Ok(());
         }
 
         let scale = ss.scale;
-        let layout = self
-            .renderer
-            .measure(&self.pending_items, &self.config, scale);
-        let new_lw = layout.width;
+
+        // Measure using the appropriate method.
+        let layout = match role {
+            SurfaceRole::Toasts => self
+                .renderer
+                .measure(&self.pending_items, &self.config, scale),
+            SurfaceRole::Center => {
+                self.renderer
+                    .measure_center(&self.center_entries, &self.config, scale)
+            }
+        };
+
+        let new_lw = match role {
+            SurfaceRole::Toasts => layout.width,
+            // Center: logical width is always config.center_width.
+            SurfaceRole::Center => self.config.center_width,
+        };
         let new_lh = layout.height;
 
-        let Some(ss) = self.surface_state.as_mut() else {
-            return Ok(());
+        let ss = match role {
+            SurfaceRole::Toasts => self.toasts.as_mut().ok_or(WlError::EventQueueMissing)?,
+            SurfaceRole::Center => self.center.as_mut().ok_or(WlError::EventQueueMissing)?,
         };
+
         if new_lw != ss.logical_w || new_lh != ss.logical_h {
             ss.layer.set_size(new_lw, new_lh);
             ss.logical_w = new_lw;
@@ -478,8 +626,6 @@ impl WlState {
         }
         ss.layout = layout.clone();
         // Record the scale that was actually used to measure this layout.
-        // Pointer events that arrive before the next redraw must use this value
-        // so that hit-testing is consistent with the committed buffer geometry.
         ss.layout_scale = scale;
 
         // Buffer dimensions: ceil(logical * scale).
@@ -501,9 +647,6 @@ impl WlState {
             );
             return Ok(());
         }
-        // All three casts are safe: required64 ≤ 64 MiB < usize::MAX on any
-        // supported 32/64-bit target; stride64 and buf_w/buf_h fit in u32/i32
-        // because required64 = stride64 * buf_h ≤ 64 MiB and stride64 = buf_w*4.
         let stride = stride64 as u32;
         let required = required64 as usize;
 
@@ -519,19 +662,37 @@ impl WlState {
             wl_shm::Format::Argb8888,
         )?;
 
-        let hover = self.current_hover.as_ref();
-        self.renderer.render(
-            canvas,
-            stride,
-            &layout,
-            &self.pending_items,
-            &self.config,
-            scale,
-            hover,
-        );
+        // Render using the appropriate method.
+        match role {
+            SurfaceRole::Toasts => {
+                let hover = self.toast_hover.as_ref();
+                self.renderer.render(
+                    canvas,
+                    stride,
+                    &layout,
+                    &self.pending_items,
+                    &self.config,
+                    scale,
+                    hover,
+                );
+            }
+            SurfaceRole::Center => {
+                let hover = self.center_hover.as_ref();
+                self.renderer.render_center(
+                    canvas,
+                    stride,
+                    &layout,
+                    &self.center_entries,
+                    &self.config,
+                    scale,
+                    hover,
+                );
+            }
+        }
 
-        let Some(ss) = self.surface_state.as_mut() else {
-            return Ok(());
+        let ss = match role {
+            SurfaceRole::Toasts => self.toasts.as_mut().ok_or(WlError::EventQueueMissing)?,
+            SurfaceRole::Center => self.center.as_mut().ok_or(WlError::EventQueueMissing)?,
         };
 
         if let Some(vp) = ss.viewport.as_ref() {
@@ -563,9 +724,31 @@ impl WlState {
         })
     }
 
-    /// Hit-test a point in buffer-pixel space.
-    fn hit_test(&self, buf_x: f64, buf_y: f64) -> Option<HitTarget> {
-        let ss = self.surface_state.as_ref()?;
+    /// Identify which surface role a `wl_surface` belongs to, if any.
+    fn surface_role_of(&self, surface: &wl_surface::WlSurface) -> Option<SurfaceRole> {
+        if self
+            .toasts
+            .as_ref()
+            .is_some_and(|ss| ss.layer.wl_surface() == surface)
+        {
+            return Some(SurfaceRole::Toasts);
+        }
+        if self
+            .center
+            .as_ref()
+            .is_some_and(|ss| ss.layer.wl_surface() == surface)
+        {
+            return Some(SurfaceRole::Center);
+        }
+        None
+    }
+
+    /// Hit-test a point in buffer-pixel space against the given surface.
+    fn hit_test(&self, role: SurfaceRole, buf_x: f64, buf_y: f64) -> Option<HitTarget> {
+        let ss = match role {
+            SurfaceRole::Toasts => self.toasts.as_ref()?,
+            SurfaceRole::Center => self.center.as_ref()?,
+        };
         let px = buf_x as i32;
         let py = buf_y as i32;
         ss.layout
@@ -575,48 +758,81 @@ impl WlState {
             .map(|r| r.target.clone())
     }
 
-    /// Convert logical (Wayland) pointer coordinates to buffer-pixel space.
+    /// Convert logical (Wayland) pointer coordinates to buffer-pixel space for a surface.
     ///
     /// Uses `layout_scale` — the scale that was active when the current layout
     /// was measured — rather than `scale` (which may already reflect a
-    /// scale-change event that has not yet been redrawn).  This avoids stale
-    /// hit-test mismatches in the same dispatch batch.
-    fn logical_to_buf(&self, lx: f64, ly: f64) -> (f64, f64) {
-        let scale = self.surface_state.as_ref().map_or(1.0, |s| s.layout_scale);
+    /// scale-change event that has not yet been redrawn).
+    fn logical_to_buf(&self, role: SurfaceRole, lx: f64, ly: f64) -> (f64, f64) {
+        let scale = match role {
+            SurfaceRole::Toasts => self.toasts.as_ref().map_or(1.0, |s| s.layout_scale),
+            SurfaceRole::Center => self.center.as_ref().map_or(1.0, |s| s.layout_scale),
+        };
         (lx * scale, ly * scale)
     }
 
-    fn handle_pointer_motion(&mut self, buf_x: f64, buf_y: f64, qh: &QueueHandle<WlState>) {
-        let new_hover = self.hit_test(buf_x, buf_y);
-        if new_hover == self.current_hover {
-            return;
-        }
+    fn handle_pointer_motion(
+        &mut self,
+        role: SurfaceRole,
+        buf_x: f64,
+        buf_y: f64,
+        qh: &QueueHandle<WlState>,
+    ) {
+        let new_hover = self.hit_test(role, buf_x, buf_y);
 
-        if let Some(HitTarget::Body(id)) = &self.current_hover {
-            let _ = self.ui_event_tx.try_send(UiEvent::HoverChanged {
-                id: *id,
-                hovered: false,
-            });
+        match role {
+            SurfaceRole::Toasts => {
+                if new_hover == self.toast_hover {
+                    return;
+                }
+                // Send hover-off for the old target.
+                if let Some(HitTarget::Body(id)) = &self.toast_hover {
+                    let _ = self.ui_event_tx.try_send(UiEvent::HoverChanged {
+                        id: *id,
+                        hovered: false,
+                    });
+                }
+                // Send hover-on for the new target.
+                if let Some(HitTarget::Body(id)) = &new_hover {
+                    let _ = self.ui_event_tx.try_send(UiEvent::HoverChanged {
+                        id: *id,
+                        hovered: true,
+                    });
+                }
+                self.toast_hover = new_hover;
+                let _ = self.redraw(qh, SurfaceRole::Toasts);
+            }
+            SurfaceRole::Center => {
+                if new_hover == self.center_hover {
+                    return;
+                }
+                self.center_hover = new_hover;
+                let _ = self.redraw(qh, SurfaceRole::Center);
+            }
         }
-
-        if let Some(HitTarget::Body(id)) = &new_hover {
-            let _ = self.ui_event_tx.try_send(UiEvent::HoverChanged {
-                id: *id,
-                hovered: true,
-            });
-        }
-
-        self.current_hover = new_hover;
-        let _ = self.redraw(qh);
     }
 
-    fn handle_pointer_leave(&mut self, qh: &QueueHandle<WlState>) {
-        let old = self.current_hover.take();
-        if let Some(HitTarget::Body(id)) = old {
-            let _ = self
-                .ui_event_tx
-                .try_send(UiEvent::HoverChanged { id, hovered: false });
-            let _ = self.redraw(qh);
+    fn handle_pointer_leave(&mut self, role: SurfaceRole, qh: &QueueHandle<WlState>) {
+        match role {
+            SurfaceRole::Toasts => {
+                let old = self.toast_hover.take();
+                if let Some(HitTarget::Body(id)) = old {
+                    let _ = self
+                        .ui_event_tx
+                        .try_send(UiEvent::HoverChanged { id, hovered: false });
+                    let _ = self.redraw(qh, SurfaceRole::Toasts);
+                } else if old.is_some() {
+                    let _ = self.redraw(qh, SurfaceRole::Toasts);
+                }
+                self.pointer_surface = PointerSurface::None;
+            }
+            SurfaceRole::Center => {
+                let had_hover = self.center_hover.take().is_some();
+                if had_hover {
+                    let _ = self.redraw(qh, SurfaceRole::Center);
+                }
+                self.pointer_surface = PointerSurface::None;
+            }
         }
     }
 }
@@ -631,20 +847,35 @@ impl CompositorHandler for WlState {
         surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        let is_ours = self
-            .surface_state
-            .as_ref()
-            .is_some_and(|ss| ss.layer.wl_surface() == surface);
-        if !is_ours {
-            return;
-        }
+        let role = self.surface_role_of(surface);
+        let Some(role) = role else { return };
+
         // Integer scale fallback when fractional-scale protocol is absent.
-        if let Some(ss) = self.surface_state.as_mut()
-            && ss.frac_scale.is_none()
-        {
-            ss.scale = new_factor as f64;
+        let has_frac = match role {
+            SurfaceRole::Toasts => self
+                .toasts
+                .as_ref()
+                .is_some_and(|ss| ss.frac_scale.is_some()),
+            SurfaceRole::Center => self
+                .center
+                .as_ref()
+                .is_some_and(|ss| ss.frac_scale.is_some()),
+        };
+        if !has_frac {
+            match role {
+                SurfaceRole::Toasts => {
+                    if let Some(ss) = self.toasts.as_mut() {
+                        ss.scale = new_factor as f64;
+                    }
+                }
+                SurfaceRole::Center => {
+                    if let Some(ss) = self.center.as_mut() {
+                        ss.scale = new_factor as f64;
+                    }
+                }
+            }
         }
-        let _ = self.redraw(qh);
+        let _ = self.redraw(qh, role);
     }
 
     fn transform_changed(
@@ -712,16 +943,30 @@ impl OutputHandler for WlState {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        let should_recreate = self.surface_state.as_ref().is_some_and(|ss| {
+        // Check toasts surface.
+        let toasts_on_output = self.toasts.as_ref().is_some_and(|ss| {
             ss.layer
                 .wl_surface()
                 .data::<SurfaceData>()
                 .is_some_and(|d| d.outputs().any(|o| o == output))
         });
-        if should_recreate {
-            self.destroy_surface();
+        if toasts_on_output {
+            self.destroy_surface(SurfaceRole::Toasts);
             if !self.pending_items.is_empty() {
-                let _ = self.create_surface(qh);
+                let _ = self.create_surface(qh, SurfaceRole::Toasts);
+            }
+        }
+        // Check center surface.
+        let center_on_output = self.center.as_ref().is_some_and(|ss| {
+            ss.layer
+                .wl_surface()
+                .data::<SurfaceData>()
+                .is_some_and(|d| d.outputs().any(|o| o == output))
+        });
+        if center_on_output {
+            self.destroy_surface(SurfaceRole::Center);
+            if self.center_visible {
+                let _ = self.create_surface(qh, SurfaceRole::Center);
             }
         }
         let _ = self.ui_event_tx.try_send(UiEvent::OutputsChanged);
@@ -729,8 +974,12 @@ impl OutputHandler for WlState {
 }
 
 impl LayerShellHandler for WlState {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.surface_state = None;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.toasts.as_ref().is_some_and(|ss| &ss.layer == layer) {
+            self.toasts = None;
+        } else if self.center.as_ref().is_some_and(|ss| &ss.layer == layer) {
+            self.center = None;
+        }
     }
 
     fn configure(
@@ -741,25 +990,45 @@ impl LayerShellHandler for WlState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let is_ours = self
-            .surface_state
-            .as_ref()
-            .is_some_and(|ss| &ss.layer == layer);
-        if !is_ours {
+        // Determine which surface got the configure.
+        let role = if self.toasts.as_ref().is_some_and(|ss| &ss.layer == layer) {
+            SurfaceRole::Toasts
+        } else if self.center.as_ref().is_some_and(|ss| &ss.layer == layer) {
+            SurfaceRole::Center
+        } else {
             return;
-        }
+        };
 
-        if let Some(ss) = self.surface_state.as_mut() {
+        let ss = match role {
+            SurfaceRole::Toasts => self.toasts.as_mut(),
+            SurfaceRole::Center => self.center.as_mut(),
+        };
+        if let Some(ss) = ss {
             ss.configured = true;
-            if configure.new_size.0 != 0 {
-                ss.logical_w = configure.new_size.0;
-            }
-            if configure.new_size.1 != 0 {
-                ss.logical_h = configure.new_size.1;
+            // For toasts: only accept compositor-forced size if non-zero.
+            // For center: width is always config.center_width; compositor may
+            // supply a height for TOP|BOTTOM|RIGHT anchored surfaces.
+            match role {
+                SurfaceRole::Toasts => {
+                    if configure.new_size.0 != 0 {
+                        ss.logical_w = configure.new_size.0;
+                    }
+                    if configure.new_size.1 != 0 {
+                        ss.logical_h = configure.new_size.1;
+                    }
+                }
+                SurfaceRole::Center => {
+                    // Fixed width from config.
+                    ss.logical_w = self.config.center_width;
+                    // Accept compositor height if non-zero.
+                    if configure.new_size.1 != 0 {
+                        ss.logical_h = configure.new_size.1;
+                    }
+                }
             }
         }
 
-        let _ = self.redraw(qh);
+        let _ = self.redraw(qh, role);
     }
 }
 
@@ -811,29 +1080,42 @@ impl PointerHandler for WlState {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let is_ours = self
-                .surface_state
-                .as_ref()
-                .is_some_and(|ss| ss.layer.wl_surface() == &event.surface);
+            // Determine which surface this event is for.
+            let event_role = self.surface_role_of(&event.surface);
 
             match &event.kind {
                 PointerEventKind::Leave { .. } => {
-                    self.handle_pointer_leave(qh);
+                    // Leave: clear hover for whichever surface we were on.
+                    let left_role = match self.pointer_surface {
+                        PointerSurface::None => None,
+                        PointerSurface::Toasts => Some(SurfaceRole::Toasts),
+                        PointerSurface::Center => Some(SurfaceRole::Center),
+                    };
+                    if let Some(role) = left_role {
+                        self.handle_pointer_leave(role, qh);
+                    }
                 }
-                _ if !is_ours => {}
                 PointerEventKind::Enter { .. } => {
-                    let (bx, by) = self.logical_to_buf(event.position.0, event.position.1);
-                    self.handle_pointer_motion(bx, by, qh);
+                    let Some(role) = event_role else { continue };
+                    self.pointer_surface = match role {
+                        SurfaceRole::Toasts => PointerSurface::Toasts,
+                        SurfaceRole::Center => PointerSurface::Center,
+                    };
+                    let (bx, by) = self.logical_to_buf(role, event.position.0, event.position.1);
+                    self.handle_pointer_motion(role, bx, by, qh);
                 }
                 PointerEventKind::Motion { .. } => {
-                    let (bx, by) = self.logical_to_buf(event.position.0, event.position.1);
-                    self.handle_pointer_motion(bx, by, qh);
+                    let Some(role) = event_role else { continue };
+                    let (bx, by) = self.logical_to_buf(role, event.position.0, event.position.1);
+                    self.handle_pointer_motion(role, bx, by, qh);
                 }
                 PointerEventKind::Press { button, .. } => {
                     if *button == 0x110 {
                         // BTN_LEFT
-                        let (bx, by) = self.logical_to_buf(event.position.0, event.position.1);
-                        if let Some(target) = self.hit_test(bx, by) {
+                        let Some(role) = event_role else { continue };
+                        let (bx, by) =
+                            self.logical_to_buf(role, event.position.0, event.position.1);
+                        if let Some(target) = self.hit_test(role, bx, by) {
                             match &target {
                                 HitTarget::Body(id) => {
                                     let _ = self.ui_event_tx.try_send(UiEvent::BodyClicked(*id));
@@ -847,6 +1129,15 @@ impl PointerHandler for WlState {
                                         id: *id,
                                         key: key.clone(),
                                     });
+                                }
+                                HitTarget::HistoryClose(id) => {
+                                    let _ = self
+                                        .ui_event_tx
+                                        .try_send(UiEvent::HistoryRemoveRequested(*id));
+                                }
+                                HitTarget::ClearAll => {
+                                    let _ =
+                                        self.ui_event_tx.try_send(UiEvent::ClearHistoryRequested);
                                 }
                             }
                         }
@@ -890,15 +1181,27 @@ impl wayland_client::Dispatch<WpFractionalScaleV1, ()> for WlState {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             // scale is in 1/120 units; convert to f64.
             let new_scale = scale as f64 / 120.0;
-            let is_ours = state
-                .surface_state
+
+            // Update whichever surface owns this frac_scale object.
+            let toast_match = state
+                .toasts
                 .as_ref()
                 .is_some_and(|ss| ss.frac_scale.as_ref().is_some_and(|fs| fs == proxy));
-            if is_ours {
-                if let Some(ss) = state.surface_state.as_mut() {
+            let center_match = state
+                .center
+                .as_ref()
+                .is_some_and(|ss| ss.frac_scale.as_ref().is_some_and(|fs| fs == proxy));
+
+            if toast_match {
+                if let Some(ss) = state.toasts.as_mut() {
                     ss.scale = new_scale;
                 }
-                let _ = state.redraw(qh);
+                let _ = state.redraw(qh, SurfaceRole::Toasts);
+            } else if center_match {
+                if let Some(ss) = state.center.as_mut() {
+                    ss.scale = new_scale;
+                }
+                let _ = state.redraw(qh, SurfaceRole::Center);
             }
         }
     }
@@ -1090,5 +1393,40 @@ mod tests {
         assert_eq!(hit(&layout, 50.0, 100.0, 1.0), Some(HitTarget::Body(2)));
         // Gap y=84..91 is empty.
         assert_eq!(hit(&layout, 50.0, 85.0, 1.0), None);
+    }
+
+    #[test]
+    fn hit_test_center_targets() {
+        // Test that center-specific HitTargets work with the same hit-test logic.
+        let layout = Layout {
+            width: 400,
+            height: 300,
+            hit_regions: vec![
+                HitRegion {
+                    rect: Rect {
+                        x: 300,
+                        y: 0,
+                        width: 100,
+                        height: 44,
+                    },
+                    target: HitTarget::ClearAll,
+                },
+                HitRegion {
+                    rect: Rect {
+                        x: 370,
+                        y: 60,
+                        width: 20,
+                        height: 20,
+                    },
+                    target: HitTarget::HistoryClose(42),
+                },
+            ],
+        };
+        assert_eq!(hit(&layout, 350.0, 20.0, 1.0), Some(HitTarget::ClearAll));
+        assert_eq!(
+            hit(&layout, 380.0, 70.0, 1.0),
+            Some(HitTarget::HistoryClose(42))
+        );
+        assert_eq!(hit(&layout, 200.0, 200.0, 1.0), None);
     }
 }

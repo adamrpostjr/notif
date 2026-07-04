@@ -39,6 +39,9 @@ history_limit = 100
 # Process HTML/Pango markup in notification bodies
 body_markup = true
 
+# Notification center panel width (logical pixels, 1–8192)
+center_width = 400
+
 # Low urgency style
 [low]
 background = "#1e1e2e"

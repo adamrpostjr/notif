@@ -7,10 +7,12 @@
 //! - t=3s: add a third notification.
 //! - t=6s: remove all; surface disappears.
 //! - t=8s: two notifications again; holds until process exits.
+//! - t=9s: SetCenter{visible:true} — center panel appears top-right.
+//! - t=12s: SetCenter{visible:false} — center panel disappears.
 //!
 //! Run with:
 //! ```sh
-//! WAYLAND_DEBUG=1 timeout 12 cargo run -p notif-wl --example wl_demo 2>debug.log
+//! WAYLAND_DEBUG=1 timeout 15 cargo run -p notif-wl --example wl_demo 2>debug.log
 //! ```
 
 use std::{
@@ -116,8 +118,41 @@ async fn async_main() {
                 return;
             }
 
+            // t=9: show the notification center panel (reuse fake notifications as history).
+            async_io::Timer::after(Duration::from_secs(1)).await;
+            let center_entries: Arc<[DisplayNotification]> = Arc::from(vec![
+                make_notif(4, Urgency::Normal, "Back again"),
+                make_notif(5, Urgency::Critical, "Still critical"),
+                make_notif(6, Urgency::Low, "Low priority item"),
+            ]);
+            println!("[wl_demo] t=9: showing notification center panel");
+            if cmd_tx
+                .send(UiCommand::SetCenter {
+                    visible: true,
+                    entries: center_entries,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            // t=12: hide the center panel.
+            async_io::Timer::after(Duration::from_secs(3)).await;
+            println!("[wl_demo] t=12: hiding notification center panel");
+            if cmd_tx
+                .send(UiCommand::SetCenter {
+                    visible: false,
+                    entries: Arc::from(vec![]),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
             // Hold for a bit so screenshots can be taken.
-            async_io::Timer::after(Duration::from_secs(10)).await;
+            async_io::Timer::after(Duration::from_secs(3)).await;
             println!("[wl_demo] shutting down");
             let _ = cmd_tx.send(UiCommand::Shutdown).await;
         }

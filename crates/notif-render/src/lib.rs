@@ -49,6 +49,10 @@ pub enum HitTarget {
         /// Action key string.
         key: String,
     },
+    /// The '×' close button on a history entry in the notification center panel.
+    HistoryClose(u32),
+    /// The 'Clear all' button in the notification center panel header.
+    ClearAll,
 }
 
 /// A hit-testable region on the rendered surface.
@@ -61,7 +65,7 @@ pub struct HitRegion {
 }
 
 /// Layout returned by [`Renderer::measure`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Layout {
     /// Logical surface width (before scale).
     pub width: u32,
@@ -104,6 +108,35 @@ pub trait Renderer: Send {
         scale: f64,
         hover: Option<&HitTarget>,
     );
+
+    /// Compute the layout for the notification center panel.
+    ///
+    /// Returns an empty [`Layout`] by default so that [`StubRenderer`] and
+    /// existing tests remain valid without changes.
+    fn measure_center(
+        &mut self,
+        _entries: &[DisplayNotification],
+        _cfg: &Config,
+        _scale: f64,
+    ) -> Layout {
+        Layout::default()
+    }
+
+    /// Render the notification center panel into `buf`.
+    ///
+    /// No-op by default so that [`StubRenderer`] and existing tests remain valid.
+    #[allow(clippy::too_many_arguments)]
+    fn render_center(
+        &mut self,
+        _buf: &mut [u8],
+        _stride: u32,
+        _layout: &Layout,
+        _entries: &[DisplayNotification],
+        _cfg: &Config,
+        _scale: f64,
+        _hover: Option<&HitTarget>,
+    ) {
+    }
 }
 
 // ── StubRenderer ──────────────────────────────────────────────────────────────

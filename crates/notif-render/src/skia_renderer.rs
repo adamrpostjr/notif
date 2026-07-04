@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent};
 use tiny_skia::{Color, Paint, Pixmap, PixmapPaint, Stroke, Transform};
@@ -28,6 +29,24 @@ use crate::{HitRegion, HitTarget, Layout, Rect, Renderer};
 
 /// Inner padding around notification content.
 const PADDING: f32 = 12.0;
+// ── Center-panel layout constants (logical pixels) ────────────────────────────
+
+/// Height of the center panel header row.
+const CENTER_HEADER_H: f32 = 44.0;
+/// Horizontal padding inside the center panel.
+const CENTER_PADDING: f32 = 10.0;
+/// Width of the per-urgency accent bar on the left of each entry.
+const CENTER_ACCENT_W: f32 = 4.0;
+/// Horizontal gap between accent bar and entry text.
+const CENTER_ACCENT_GAP: f32 = 8.0;
+/// Size of the '×' close button in center entries.
+const CENTER_CLOSE_SIZE: f32 = 20.0;
+/// Inset of the '×' close button from the right edge.
+const CENTER_CLOSE_INSET: f32 = 6.0;
+/// Vertical padding inside each center entry (top and bottom).
+const CENTER_ENTRY_PAD: f32 = 8.0;
+/// Height of the hairline separator between entries (buffer pixels, not logical).
+const CENTER_SEP_H: f32 = 1.0;
 /// Close-button square size.
 const CLOSE_SIZE: f32 = 20.0;
 /// Close-button inset from the top-right corner.
@@ -289,6 +308,70 @@ struct CachedFrame {
     geometries: Vec<NotifGeometry>,
 }
 
+// ── Center-panel geometry ─────────────────────────────────────────────────────
+
+/// Shaped geometry for one entry row in the notification center panel.
+struct CenterEntryGeometry {
+    /// Full entry bounding rect (buffer px, relative to panel top-left).
+    entry_rect: Rect,
+    /// Left accent bar (buffer px).
+    accent_rect: Rect,
+    /// '×' close-button rect (buffer px); target: `HitTarget::HistoryClose(id)`.
+    close_rect: Rect,
+    /// Pre-shaped summary line (bold).
+    summary_buffer: Buffer,
+    summary_h: f32,
+    /// Pre-shaped meta line ("{app_name} · {relative age}") — dimmed.
+    meta_buffer: Buffer,
+    meta_h: f32,
+    /// Pre-shaped body line (one line, ellipsized); empty buffer → no runs.
+    body_buffer: Buffer,
+    /// Shaped height of the body line; stored for future layout use.
+    #[allow(dead_code)]
+    body_h: f32,
+    has_body: bool,
+}
+
+/// Geometry for the center-panel header row.
+struct CenterHeaderGeometry {
+    /// Full header rect (buffer px).
+    header_rect: Rect,
+    /// Pre-shaped title "Notifications (N)".
+    title_buffer: Buffer,
+    /// "Clear all" text rect (hit target).
+    clear_all_rect: Rect,
+    /// Pre-shaped "Clear all" text.
+    clear_all_buffer: Buffer,
+}
+
+/// Cached result of `measure_center`.
+struct CenterCachedFrame {
+    key: CenterCacheKey,
+    header: CenterHeaderGeometry,
+    entries: Vec<CenterEntryGeometry>,
+    /// "No notifications" placeholder buffer (None when entries is non-empty).
+    placeholder_buffer: Option<Buffer>,
+    /// Total buffer height (header + all entries + separator pixels).
+    total_buf_h: u32,
+}
+
+/// Cache key for the center panel — hover is deliberately excluded.
+#[derive(PartialEq)]
+struct CenterCacheKey {
+    items: Vec<CenterItemKey>,
+    scale_bits: u64,
+    config_hash: u64,
+}
+
+#[derive(PartialEq, Eq)]
+struct CenterItemKey {
+    id: u32,
+    summary: String,
+    app_name: String,
+    body: String,
+    urgency: notif_types::Urgency,
+}
+
 // ── Text shaping helpers (free functions to allow split borrows) ──────────────
 
 /// Map the config font family string to a cosmic-text [`Family`].
@@ -457,6 +540,11 @@ pub struct SkiaRenderer {
     icon_cache: HashMap<CacheKey, Option<Pixmap>>,
     /// One-slot frame cache: geometry + shaped text buffers for the last measured/rendered set.
     frame_cache: Option<CachedFrame>,
+    /// One-slot cache for the center panel geometry.
+    center_cache: Option<CenterCachedFrame>,
+    /// When `Some`, overrides `SystemTime::now()` in center age computation.
+    /// Set in tests for deterministic golden output.
+    pub now_override: Option<SystemTime>,
 }
 
 impl SkiaRenderer {
@@ -467,6 +555,8 @@ impl SkiaRenderer {
             swash_cache: SwashCache::new(),
             icon_cache: HashMap::new(),
             frame_cache: None,
+            center_cache: None,
+            now_override: None,
         }
     }
 
@@ -488,6 +578,8 @@ impl SkiaRenderer {
             swash_cache: SwashCache::new(),
             icon_cache: HashMap::new(),
             frame_cache: None,
+            center_cache: None,
+            now_override: None,
         }
     }
 
@@ -536,6 +628,539 @@ impl SkiaRenderer {
             scale_bits: scale.to_bits(),
             config_hash,
         }
+    }
+
+    // ── Center-panel helpers ───────────────────────────────────────────────────
+
+    /// Build a [`CenterCacheKey`] from the current entries, scale, and config.
+    fn make_center_cache_key(
+        entries: &[DisplayNotification],
+        scale: f64,
+        cfg: &Config,
+    ) -> CenterCacheKey {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        cfg.hash(&mut hasher);
+        let config_hash = hasher.finish();
+
+        let items = entries
+            .iter()
+            .map(|dn| {
+                let n = &dn.notification;
+                CenterItemKey {
+                    id: n.id,
+                    summary: n.summary.clone(),
+                    app_name: n.app_name.clone(),
+                    body: n.body.clone(),
+                    urgency: n.urgency,
+                }
+            })
+            .collect();
+
+        CenterCacheKey {
+            items,
+            scale_bits: scale.to_bits(),
+            config_hash,
+        }
+    }
+
+    /// Format a relative age string given the creation time and current time.
+    ///
+    /// Results: "just now", "Xm ago", "Xh ago", "Xd ago".
+    fn format_relative_age(created_at: SystemTime, now: SystemTime) -> String {
+        let secs = now.duration_since(created_at).unwrap_or_default().as_secs();
+        if secs < 60 {
+            "just now".to_owned()
+        } else if secs < 3600 {
+            format!("{}m ago", secs / 60)
+        } else if secs < 86400 {
+            format!("{}h ago", secs / 3600)
+        } else {
+            format!("{}d ago", secs / 86400)
+        }
+    }
+
+    /// Build the center panel cache (header + per-entry geometries).
+    ///
+    /// `buf_w` is the buffer-pixel panel width.  `now` is the reference time
+    /// for relative-age strings (set to `now_override` in tests).
+    fn compute_center_cache(
+        font_system: &mut FontSystem,
+        entries: &[DisplayNotification],
+        cfg: &Config,
+        scale: f64,
+        now: SystemTime,
+    ) -> CenterCachedFrame {
+        let s = scale as f32;
+        let buf_w = (cfg.center_width as f64 * scale).ceil() as u32;
+        let bw = buf_w as f32;
+        let font_size = cfg.font_size * s;
+        let family = family_of(cfg);
+
+        // ── Header ────────────────────────────────────────────────────────────
+        let header_h = (CENTER_HEADER_H * s).ceil() as u32;
+        let header_rect = Rect {
+            x: 0,
+            y: 0,
+            width: buf_w,
+            height: header_h,
+        };
+
+        let title_text = format!("Notifications ({})", entries.len());
+        let title_spans = [Span {
+            text: title_text,
+            bold: true,
+            italic: false,
+            underline: false,
+        }];
+        // Title width is bounded to leave room for the "Clear all" button.
+        let clear_all_text = "Clear all";
+        let clear_all_spans = [Span::plain(clear_all_text)];
+        let (clear_all_buf, _, _) =
+            shape_spans(font_system, &clear_all_spans, family, font_size, 200.0);
+        let mut ca_w = 0.0f32;
+        for run in clear_all_buf.layout_runs() {
+            if run.line_w > ca_w {
+                ca_w = run.line_w;
+            }
+        }
+        let ca_btn_w = (ca_w.ceil() + CENTER_PADDING * s * 2.0).max(60.0 * s);
+        let title_w = (bw - CENTER_PADDING * s - ca_btn_w - CENTER_PADDING * s).max(40.0);
+        let (title_buf, _, _) = shape_spans(font_system, &title_spans, family, font_size, title_w);
+
+        let clear_all_rect = Rect {
+            x: (bw - CENTER_PADDING * s - ca_btn_w) as i32,
+            y: 0,
+            width: (ca_btn_w + CENTER_PADDING * s) as u32,
+            height: header_h,
+        };
+
+        let header_geom = CenterHeaderGeometry {
+            header_rect,
+            title_buffer: title_buf,
+            clear_all_rect,
+            clear_all_buffer: clear_all_buf,
+        };
+
+        // ── Entries ───────────────────────────────────────────────────────────
+        let summary_font_size = font_size * 1.05_f32;
+        let meta_font_size = font_size * 0.9_f32;
+        let line_h = (font_size * 1.3).ceil();
+        let close_sz = (CENTER_CLOSE_SIZE * s) as u32;
+        let accent_w = (CENTER_ACCENT_W * s).ceil() as u32;
+        let text_x_offset = accent_w as f32 + CENTER_ACCENT_GAP * s;
+        let text_w = (bw
+            - text_x_offset
+            - CENTER_CLOSE_SIZE * s
+            - CENTER_CLOSE_INSET * s
+            - CENTER_PADDING * s)
+            .max(40.0);
+
+        let mut y_cursor = header_h as i32;
+        let mut entry_geoms: Vec<CenterEntryGeometry> = Vec::with_capacity(entries.len());
+
+        for dn in entries {
+            let n = &dn.notification;
+
+            // Summary: bold, single line.
+            let summary_spans = [Span {
+                text: n.summary.clone(),
+                bold: true,
+                italic: false,
+                underline: false,
+            }];
+            let (_, summary_h_raw, summary_buf) = clamp_spans_to_lines(
+                font_system,
+                &summary_spans,
+                family,
+                summary_font_size,
+                text_w,
+                1,
+            );
+            let summary_h = summary_h_raw.max(line_h);
+
+            // Meta line: "{app_name} · {age}".
+            let age = Self::format_relative_age(n.created_at, now);
+            let meta_text = if n.app_name.is_empty() {
+                age
+            } else {
+                format!("{} · {}", n.app_name, age)
+            };
+            let meta_spans = [Span::plain(meta_text)];
+            let (_, meta_h_raw, meta_buf) =
+                clamp_spans_to_lines(font_system, &meta_spans, family, meta_font_size, text_w, 1);
+            let meta_h = meta_h_raw.max((meta_font_size * 1.3).ceil());
+
+            // Body line: one line, ellipsized (skip if empty).
+            let body_empty = n.body.trim().is_empty();
+            let (body_buf, body_h, has_body) = if body_empty {
+                let dummy = {
+                    let metrics = cosmic_text::Metrics::new(font_size, line_h);
+                    let mut b = cosmic_text::Buffer::new(font_system, metrics);
+                    b.set_size(Some(text_w.max(1.0)), None);
+                    b
+                };
+                (dummy, 0.0_f32, false)
+            } else {
+                let body_src: Vec<Span> = if cfg.body_markup {
+                    parse_markup(&n.body)
+                } else {
+                    vec![Span::plain(n.body.clone())]
+                };
+                let (b_spans, b_h, b_buf) =
+                    clamp_spans_to_lines(font_system, &body_src, family, font_size, text_w, 1);
+                let _ = b_spans;
+                (b_buf, b_h.max(line_h), true)
+            };
+
+            let pad = CENTER_ENTRY_PAD * s;
+            let text_total_h = summary_h + meta_h + if has_body { body_h } else { 0.0 };
+            let entry_h = (pad + text_total_h + pad + CENTER_SEP_H * s).ceil() as u32;
+
+            let entry_rect = Rect {
+                x: 0,
+                y: y_cursor,
+                width: buf_w,
+                height: entry_h,
+            };
+            let accent_rect = Rect {
+                x: 0,
+                y: y_cursor,
+                width: accent_w,
+                height: entry_h,
+            };
+            let close_x = (bw - CENTER_CLOSE_INSET * s - close_sz as f32) as i32;
+            let close_y = y_cursor + ((entry_h as f32 - close_sz as f32) / 2.0) as i32;
+            let close_rect = Rect {
+                x: close_x,
+                y: close_y,
+                width: close_sz,
+                height: close_sz,
+            };
+
+            entry_geoms.push(CenterEntryGeometry {
+                entry_rect,
+                accent_rect,
+                close_rect,
+                summary_buffer: summary_buf,
+                summary_h,
+                meta_buffer: meta_buf,
+                meta_h,
+                body_buffer: body_buf,
+                body_h,
+                has_body,
+            });
+
+            y_cursor += entry_h as i32;
+        }
+
+        // ── Placeholder ───────────────────────────────────────────────────────
+        let placeholder_buffer = if entries.is_empty() {
+            let placeholder_spans = [Span::plain("No notifications")];
+            let (pb, _, _) = shape_spans(
+                font_system,
+                &placeholder_spans,
+                family,
+                font_size,
+                bw - CENTER_PADDING * s * 2.0,
+            );
+            Some(pb)
+        } else {
+            None
+        };
+
+        // Total panel height: entries down to y_cursor; if empty, show a fixed placeholder height.
+        let total_buf_h = if entries.is_empty() {
+            let placeholder_h = (CENTER_ENTRY_PAD * s * 4.0 + font_size * 1.3).ceil() as u32;
+            header_h + placeholder_h
+        } else {
+            y_cursor.max(0) as u32
+        };
+
+        CenterCachedFrame {
+            key: CenterCacheKey {
+                items: Vec::new(), // filled by caller
+                scale_bits: 0,
+                config_hash: 0,
+            },
+            header: header_geom,
+            entries: entry_geoms,
+            placeholder_buffer,
+            total_buf_h,
+        }
+    }
+
+    /// Draw a filled rectangle using pre-multiplied RGBA color bytes.
+    fn fill_rect_premul(pixmap: &mut Pixmap, rect: &Rect, [r, g, b, a]: [u8; 4]) {
+        let px_w = pixmap.width() as i32;
+        let px_h = pixmap.height() as i32;
+        let x0 = rect.x.max(0);
+        let y0 = rect.y.max(0);
+        let x1 = (rect.x + rect.width as i32).min(px_w);
+        let y1 = (rect.y + rect.height as i32).min(px_h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let data = pixmap.data_mut();
+        for row in y0..y1 {
+            for col in x0..x1 {
+                let idx = (row * px_w + col) as usize * 4;
+                if let Some(px) = data.get_mut(idx..idx + 4) {
+                    px.copy_from_slice(&[r, g, b, a]);
+                }
+            }
+        }
+    }
+
+    /// Render the center panel onto `pixmap` using the cached geometry.
+    fn render_center_pixmap(
+        &mut self,
+        pixmap: &mut Pixmap,
+        cfg: &Config,
+        scale: f64,
+        entries: &[DisplayNotification],
+        hover: Option<&HitTarget>,
+    ) {
+        let s = scale as f32;
+        let bw = pixmap.width() as f32;
+        let bh = pixmap.height() as f32;
+
+        // ── Background ────────────────────────────────────────────────────────
+        let bg = cfg.normal.background;
+        // Premultiply panel background (fully opaque).
+        let bg_pre = [bg.b, bg.g, bg.r, 0xff];
+        // Slightly lighter header background.
+        let hdr_bg = [
+            bg.b.saturating_add(0x10),
+            bg.g.saturating_add(0x10),
+            bg.r.saturating_add(0x10),
+            0xff,
+        ];
+        // Separator color: slightly lighter than bg.
+        let sep_rgba = [
+            bg.b.saturating_add(0x28),
+            bg.g.saturating_add(0x28),
+            bg.r.saturating_add(0x28),
+            0xff,
+        ];
+
+        // Borrow the cached frame temporarily.
+        let Some(cached) = self.center_cache.take() else {
+            return;
+        };
+
+        // Fill full panel background.
+        let panel_rect = Rect {
+            x: 0,
+            y: 0,
+            width: pixmap.width(),
+            height: pixmap.height(),
+        };
+        Self::fill_rect_premul(pixmap, &panel_rect, bg_pre);
+
+        // ── Header ────────────────────────────────────────────────────────────
+        let header_h = cached.header.header_rect.height as f32;
+        let hdr_rect = Rect {
+            x: 0,
+            y: 0,
+            width: pixmap.width(),
+            height: cached.header.header_rect.height,
+        };
+        Self::fill_rect_premul(pixmap, &hdr_rect, hdr_bg);
+
+        // Draw title text left-aligned.
+        let fg = cfg.normal.foreground;
+        Self::render_spans_into(
+            pixmap,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &cached.header.title_buffer,
+            CENTER_PADDING * s,
+            (header_h - cfg.font_size * s * 1.3) * 0.5,
+            header_h,
+            cfg.font_size * s,
+            fg,
+        );
+
+        // Draw "Clear all" button — highlight on hover.
+        let clear_all_hovered = hover.is_some_and(|t| *t == HitTarget::ClearAll);
+        if clear_all_hovered {
+            let hl = [
+                bg.b.saturating_add(0x30),
+                bg.g.saturating_add(0x30),
+                bg.r.saturating_add(0x30),
+                0xff,
+            ];
+            Self::fill_rect_premul(pixmap, &cached.header.clear_all_rect, hl);
+        }
+        let ca_fg = notif_types::config::Rgba {
+            r: fg.r,
+            g: fg.g,
+            b: fg.b,
+            a: if clear_all_hovered {
+                fg.a
+            } else {
+                (fg.a as u32 * 3 / 4) as u8
+            },
+        };
+        let ca_rect = &cached.header.clear_all_rect;
+        Self::render_spans_into(
+            pixmap,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &cached.header.clear_all_buffer,
+            ca_rect.x as f32 + CENTER_PADDING * s,
+            (header_h - cfg.font_size * s * 1.3) * 0.5,
+            header_h,
+            cfg.font_size * s,
+            ca_fg,
+        );
+
+        // Separator under header.
+        let hdr_sep_rect = Rect {
+            x: 0,
+            y: hdr_rect.height as i32,
+            width: pixmap.width(),
+            height: 1,
+        };
+        Self::fill_rect_premul(pixmap, &hdr_sep_rect, sep_rgba);
+
+        // ── Entries ───────────────────────────────────────────────────────────
+        let font_size_buf = cfg.font_size * s;
+        let summary_font_size = font_size_buf * 1.05_f32;
+        let meta_font_size = font_size_buf * 0.9_f32;
+
+        if cached.entries.is_empty() {
+            // "No notifications" placeholder.
+            if let Some(ref ph_buf) = cached.placeholder_buffer {
+                let ph_y = header_h + CENTER_ENTRY_PAD * s * 2.0;
+                // Center the text horizontally.
+                let mut ph_w = 0.0f32;
+                for run in ph_buf.layout_runs() {
+                    if run.line_w > ph_w {
+                        ph_w = run.line_w;
+                    }
+                }
+                let ph_x = ((bw - ph_w) / 2.0).max(CENTER_PADDING * s);
+                let ph_fg = notif_types::config::Rgba {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                    a: (fg.a as u32 * 3 / 5) as u8,
+                };
+                Self::render_spans_into(
+                    pixmap,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    ph_buf,
+                    ph_x,
+                    ph_y,
+                    bh,
+                    font_size_buf,
+                    ph_fg,
+                );
+            }
+        } else {
+            for (idx, (dn, geo)) in entries.iter().zip(cached.entries.iter()).enumerate() {
+                let n = &dn.notification;
+                let style = match n.urgency {
+                    notif_types::Urgency::Low => &cfg.low,
+                    notif_types::Urgency::Normal => &cfg.normal,
+                    notif_types::Urgency::Critical => &cfg.critical,
+                };
+                let entry_y = geo.entry_rect.y as f32;
+                let entry_h = geo.entry_rect.height as f32;
+
+                // Accent bar (left edge, urgency border color).
+                let bc = style.border_color;
+                let accent_pre = premultiply_rgba(bc.r, bc.g, bc.b, bc.a);
+                // RGBA → premul RGBA → we store RGBA in pixmap (tiny-skia is RGBA).
+                Self::fill_rect_premul(
+                    pixmap,
+                    &geo.accent_rect,
+                    [accent_pre[0], accent_pre[1], accent_pre[2], accent_pre[3]],
+                );
+
+                // Row hover highlight (lighten bg slightly).
+                let close_hovered = hover.is_some_and(|t| *t == HitTarget::HistoryClose(n.id));
+
+                // Entry text X start (after accent bar + gap).
+                let accent_w = geo.accent_rect.width as f32;
+                let text_x = accent_w + CENTER_ACCENT_GAP * s;
+                let pad = CENTER_ENTRY_PAD * s;
+                let mut text_y = entry_y + pad;
+                let clip_bottom = entry_y + entry_h - CENTER_SEP_H * s;
+
+                // Summary (bold).
+                Self::render_spans_into(
+                    pixmap,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &geo.summary_buffer,
+                    text_x,
+                    text_y,
+                    clip_bottom,
+                    summary_font_size,
+                    fg,
+                );
+                text_y += geo.summary_h;
+
+                // Meta line (dimmed).
+                let meta_fg = notif_types::config::Rgba {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                    a: (fg.a as u32 * 7 / 10) as u8,
+                };
+                Self::render_spans_into(
+                    pixmap,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &geo.meta_buffer,
+                    text_x,
+                    text_y,
+                    clip_bottom,
+                    meta_font_size,
+                    meta_fg,
+                );
+                text_y += geo.meta_h;
+
+                // Body (if present).
+                if geo.has_body {
+                    Self::render_spans_into(
+                        pixmap,
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        &geo.body_buffer,
+                        text_x,
+                        text_y,
+                        clip_bottom,
+                        font_size_buf,
+                        meta_fg,
+                    );
+                }
+
+                // '×' close button.
+                Self::draw_close_button(pixmap, &geo.close_rect, scale, fg, close_hovered);
+
+                // Hairline separator at bottom of entry (not on last entry).
+                if idx + 1 < entries.len() {
+                    let sep_y = (entry_y + entry_h - CENTER_SEP_H * s).round() as i32;
+                    let sep_rect = Rect {
+                        x: 0,
+                        y: sep_y,
+                        width: pixmap.width(),
+                        height: 1,
+                    };
+                    Self::fill_rect_premul(pixmap, &sep_rect, sep_rgba);
+                }
+            }
+        }
+
+        // Put the cache back.
+        self.center_cache = Some(cached);
     }
 
     /// Convert a raw `image-data` hint image into a premultiplied RGBA pixmap,
@@ -1461,6 +2086,121 @@ impl Renderer for SkiaRenderer {
 
         // Copy RGBA pixmap → BGRA output buffer (wl_shm ARGB8888 little-endian).
         // This is the single swizzle point for the whole crate.
+        let pix_data = pixmap.data();
+        let pix_w = pixmap.width();
+
+        for row in 0..buf_h.min(pixmap.height()) {
+            let buf_row_start = row as usize * stride as usize;
+            let pix_row_start = row as usize * pix_w as usize * 4;
+
+            for col in 0..buf_w.min(pix_w) {
+                let pix_idx = pix_row_start + col as usize * 4;
+                let buf_idx = buf_row_start + col as usize * 4;
+
+                let r = pix_data.get(pix_idx).copied().unwrap_or(0);
+                let g = pix_data.get(pix_idx + 1).copied().unwrap_or(0);
+                let b = pix_data.get(pix_idx + 2).copied().unwrap_or(0);
+                let a = pix_data.get(pix_idx + 3).copied().unwrap_or(0);
+
+                // RGBA → BGRA
+                if let Some(px) = buf.get_mut(buf_idx..buf_idx + 4) {
+                    px.copy_from_slice(&[b, g, r, a]);
+                }
+            }
+        }
+    }
+
+    fn measure_center(
+        &mut self,
+        entries: &[DisplayNotification],
+        cfg: &Config,
+        scale: f64,
+    ) -> Layout {
+        let new_key = Self::make_center_cache_key(entries, scale, cfg);
+
+        if self.center_cache.as_ref().is_none_or(|c| c.key != new_key) {
+            let now = self.now_override.unwrap_or_else(SystemTime::now);
+            let mut frame =
+                Self::compute_center_cache(&mut self.font_system, entries, cfg, scale, now);
+            frame.key = new_key;
+            self.center_cache = Some(frame);
+        }
+
+        let Some(cached) = self.center_cache.as_ref() else {
+            return Layout::default();
+        };
+        let total_buf_h = cached.total_buf_h;
+        let logical_h = (total_buf_h as f64 / scale).ceil() as u32;
+
+        // Build hit regions for the center panel.
+        // Hit regions are stored in buffer-pixel space (already scaled), matching
+        // what notif-wl expects for pointer hit-testing.
+        let mut hit_regions = Vec::new();
+
+        // "Clear all" button in header (buffer-pixel coordinates).
+        let clear_all_buf_rect = cached.header.clear_all_rect;
+        hit_regions.push(HitRegion {
+            rect: clear_all_buf_rect,
+            target: HitTarget::ClearAll,
+        });
+
+        // Close button for each entry (buffer-pixel coordinates).
+        for (dn, geo) in entries.iter().zip(cached.entries.iter()) {
+            hit_regions.push(HitRegion {
+                rect: geo.close_rect,
+                target: HitTarget::HistoryClose(dn.notification.id),
+            });
+        }
+
+        Layout {
+            width: cfg.center_width,
+            height: logical_h,
+            hit_regions,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_center(
+        &mut self,
+        buf: &mut [u8],
+        stride: u32,
+        layout: &Layout,
+        entries: &[DisplayNotification],
+        cfg: &Config,
+        scale: f64,
+        hover: Option<&HitTarget>,
+    ) {
+        buf.fill(0);
+
+        if layout.width == 0 || layout.height == 0 {
+            return;
+        }
+
+        let buf_w = ((layout.width as f64 * scale).ceil()) as u32;
+        let buf_h = ((layout.height as f64 * scale).ceil()) as u32;
+
+        if buf_w == 0 || buf_h == 0 {
+            return;
+        }
+
+        // Ensure the center cache is populated (measure_center may not have been called).
+        let new_key = Self::make_center_cache_key(entries, scale, cfg);
+        if self.center_cache.as_ref().is_none_or(|c| c.key != new_key) {
+            let now = self.now_override.unwrap_or_else(SystemTime::now);
+            let mut frame =
+                Self::compute_center_cache(&mut self.font_system, entries, cfg, scale, now);
+            frame.key = new_key;
+            self.center_cache = Some(frame);
+        }
+
+        let mut pixmap = match Pixmap::new(buf_w, buf_h) {
+            Some(p) => p,
+            None => return,
+        };
+
+        self.render_center_pixmap(&mut pixmap, cfg, scale, entries, hover);
+
+        // Copy RGBA pixmap → BGRA output buffer (wl_shm ARGB8888 little-endian).
         let pix_data = pixmap.data();
         let pix_w = pixmap.width();
 
