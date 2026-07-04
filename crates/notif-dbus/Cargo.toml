@@ -5,3 +5,18 @@ edition = "2024"
 
 [lints]
 workspace = true
+
+[dependencies]
+notif-types = { path = "../notif-types" }
+zbus = { workspace = true }
+zvariant = { workspace = true }
+async-channel = { workspace = true }
+futures-lite = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+async-io = { workspace = true }
+
+[[example]]
+name = "echo_daemon"

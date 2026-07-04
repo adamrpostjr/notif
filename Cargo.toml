@@ -22,6 +22,7 @@ inotify = { version = "0.11", default-features = false }
 thiserror = "2"
 log = "0.4"
 zvariant = "5"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
 tempfile = "3"
 
 [workspace.lints.rust]
