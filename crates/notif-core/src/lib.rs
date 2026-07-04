@@ -76,7 +76,7 @@ pub struct Core<C: Clock> {
     /// Overflow queue; front = oldest waiting.
     waiting: VecDeque<Notification>,
     /// Closed-notification history; front = oldest.
-    history: VecDeque<Notification>,
+    history: VecDeque<Arc<Notification>>,
     /// Do-Not-Disturb mode.  When on, non-Critical incoming notifications are
     /// silently added to history instead of being displayed.
     dnd: bool,
@@ -457,7 +457,11 @@ impl<C: Clock> Core<C> {
 
     /// Return the history ring as a `Vec<HistoryEntry>`, newest first.
     pub fn handle_query_history(&self) -> Vec<HistoryEntry> {
-        self.history.iter().rev().map(HistoryEntry::from).collect()
+        self.history
+            .iter()
+            .rev()
+            .map(|n| HistoryEntry::from(&**n))
+            .collect()
     }
 
     // ── Handle IPC Status query ───────────────────────────────────────────────
@@ -548,7 +552,7 @@ impl<C: Clock> Core<C> {
             .history
             .iter()
             .rev()
-            .map(|n| DisplayNotification::new(n.clone()))
+            .map(|n| DisplayNotification::from_arc(Arc::clone(n)))
             .collect();
         UiCommand::SetCenter {
             visible: self.center_visible,
@@ -587,13 +591,17 @@ impl<C: Clock> Core<C> {
         if n.transient {
             return;
         }
-        // Clone the inner value so we can mutate (strip large image data).
-        let mut owned = (*n).clone();
-        // Strip raw image data — it can be large and is not needed in history.
-        if matches!(owned.image, Some(ImageSource::Data(_))) {
-            owned.image = None;
-        }
-        self.history.push_back(owned);
+        // Only clone the inner value when we need to strip raw image data.
+        // For path/icon images and no-image notifications, store the Arc directly
+        // with zero additional allocations.
+        let arc = if matches!(n.image, Some(ImageSource::Data(_))) {
+            let mut stripped = (*n).clone();
+            stripped.image = None;
+            Arc::new(stripped)
+        } else {
+            n
+        };
+        self.history.push_back(arc);
         while self.history.len() > self.config.history_limit {
             self.history.pop_front();
         }

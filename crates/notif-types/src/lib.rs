@@ -230,6 +230,16 @@ impl DisplayNotification {
             hovered: false,
         }
     }
+
+    /// Create a `DisplayNotification` from an already-Arc-wrapped notification,
+    /// with hover cleared.  Zero additional allocation when the Arc is simply
+    /// cloned from the history ring.
+    pub fn from_arc(notification: Arc<Notification>) -> Self {
+        Self {
+            notification,
+            hovered: false,
+        }
+    }
 }
 
 /// Serializable summary of a notification for IPC / history consumers.

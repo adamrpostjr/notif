@@ -356,20 +356,14 @@ struct CenterCachedFrame {
 }
 
 /// Cache key for the center panel — hover is deliberately excluded.
+///
+/// The `fingerprint` is a single `u64` hash of (entry count, scale bits,
+/// config hash, and per-entry: id, summary, body, app_name, urgency,
+/// created_at).  No per-entry string allocations; any content change produces
+/// a different fingerprint with overwhelming probability.
 #[derive(PartialEq)]
 struct CenterCacheKey {
-    items: Vec<CenterItemKey>,
-    scale_bits: u64,
-    config_hash: u64,
-}
-
-#[derive(PartialEq, Eq)]
-struct CenterItemKey {
-    id: u32,
-    summary: String,
-    app_name: String,
-    body: String,
-    urgency: notif_types::Urgency,
+    fingerprint: u64,
 }
 
 // ── Text shaping helpers (free functions to allow split borrows) ──────────────
@@ -633,6 +627,10 @@ impl SkiaRenderer {
     // ── Center-panel helpers ───────────────────────────────────────────────────
 
     /// Build a [`CenterCacheKey`] from the current entries, scale, and config.
+    ///
+    /// All fields that affect center layout are folded into a single `u64`
+    /// fingerprint via `DefaultHasher` — no per-entry string allocations.
+    /// Hover state is deliberately excluded so hover-only redraws are cache hits.
     fn make_center_cache_key(
         entries: &[DisplayNotification],
         scale: f64,
@@ -642,27 +640,30 @@ impl SkiaRenderer {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
+        // Config affects layout and colours.
         cfg.hash(&mut hasher);
-        let config_hash = hasher.finish();
-
-        let items = entries
-            .iter()
-            .map(|dn| {
-                let n = &dn.notification;
-                CenterItemKey {
-                    id: n.id,
-                    summary: n.summary.clone(),
-                    app_name: n.app_name.clone(),
-                    body: n.body.clone(),
-                    urgency: n.urgency,
-                }
-            })
-            .collect();
+        // Scale factor.
+        scale.to_bits().hash(&mut hasher);
+        // Entry count (so an empty → non-empty transition is always a miss).
+        entries.len().hash(&mut hasher);
+        // Per-entry content fields (hash &str directly — no allocation).
+        for dn in entries {
+            let n = &dn.notification;
+            n.id.hash(&mut hasher);
+            n.summary.as_str().hash(&mut hasher);
+            n.body.as_str().hash(&mut hasher);
+            n.app_name.as_str().hash(&mut hasher);
+            (n.urgency as u8).hash(&mut hasher);
+            // created_at affects the relative-age string displayed in the meta line.
+            n.created_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .hash(&mut hasher);
+        }
 
         CenterCacheKey {
-            items,
-            scale_bits: scale.to_bits(),
-            config_hash,
+            fingerprint: hasher.finish(),
         }
     }
 
@@ -880,11 +881,7 @@ impl SkiaRenderer {
         };
 
         CenterCachedFrame {
-            key: CenterCacheKey {
-                items: Vec::new(), // filled by caller
-                scale_bits: 0,
-                config_hash: 0,
-            },
+            key: CenterCacheKey { fingerprint: 0 }, // filled by caller via `frame.key = new_key`
             header: header_geom,
             entries: entry_geoms,
             placeholder_buffer,
@@ -2466,6 +2463,60 @@ mod tests {
         assert_eq!(
             after_render2, after_render1,
             "render() with different hover must not reshape (hover not part of cache key)"
+        );
+    }
+
+    /// `measure_center()` + `render_center()` + `render_center(different hover)` on
+    /// the same entries must shape each text region exactly once.  Hover-only center
+    /// redraws must be cache hits with zero additional shaping.
+    #[test]
+    fn shape_count_regression_center() {
+        use crate::{HitTarget, Renderer};
+        use notif_types::config::Config;
+        use std::time::SystemTime;
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fonts");
+        let paths = vec![dir.join("DejaVuSans.ttf"), dir.join("DejaVuSans-Bold.ttf")];
+        let mut renderer = SkiaRenderer::with_font_files(&paths);
+        // Pin "now" for deterministic relative-age strings.
+        renderer.now_override = Some(SystemTime::UNIX_EPOCH);
+        let cfg = Config::default();
+        let entries = vec![make_test_dn(10), make_test_dn(11)];
+
+        // Reset counter.
+        reset_shape_count();
+        let before = get_shape_count();
+
+        // measure_center() — must fill the center cache.
+        let layout = renderer.measure_center(&entries, &cfg, 1.0);
+        let after_measure = get_shape_count();
+        let shapes_in_measure = after_measure - before;
+        assert!(
+            shapes_in_measure > 0,
+            "measure_center must perform some shaping"
+        );
+
+        // render_center() — must be a cache hit; no new shaping.
+        let buf_w = (layout.width as f64 * 1.0).ceil() as u32;
+        let buf_h = (layout.height as f64 * 1.0).ceil() as u32;
+        let stride = buf_w * 4;
+        let mut buf = vec![0u8; (stride * buf_h) as usize];
+        renderer.render_center(&mut buf, stride, &layout, &entries, &cfg, 1.0, None);
+
+        let after_render1 = get_shape_count();
+        assert_eq!(
+            after_render1, after_measure,
+            "render_center() on same entries must not reshape (cache hit)"
+        );
+
+        // render_center() again with a different hover — still a cache hit.
+        let hover = HitTarget::HistoryClose(10);
+        renderer.render_center(&mut buf, stride, &layout, &entries, &cfg, 1.0, Some(&hover));
+
+        let after_render2 = get_shape_count();
+        assert_eq!(
+            after_render2, after_render1,
+            "render_center() with different hover must not reshape (hover not part of cache key)"
         );
     }
 }
