@@ -345,6 +345,14 @@ impl WlState {
             UiCommand::Shutdown => {
                 self.shutdown = true;
             }
+            UiCommand::SetCenter { visible, .. } => {
+                // Phase 2 Task 8 (center panel rendering) is not yet implemented.
+                // Log and ignore so the run loop compiles; the real surface
+                // management will be added in Task 8.
+                log::debug!(
+                    "notif-wl: SetCenter(visible={visible}) — center rendering not yet implemented"
+                );
+            }
         }
         Ok(())
     }

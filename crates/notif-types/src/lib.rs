@@ -232,6 +232,58 @@ impl DisplayNotification {
     }
 }
 
+/// Serializable summary of a notification for IPC / history consumers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// The notification's server-assigned ID.
+    pub id: u32,
+    /// Application name.
+    pub app_name: String,
+    /// One-line summary text.
+    pub summary: String,
+    /// Optional multi-line body.
+    pub body: String,
+    /// Urgency level.
+    pub urgency: Urgency,
+    /// Creation time as seconds since the Unix epoch.
+    pub created_at_unix: u64,
+}
+
+impl From<&Notification> for HistoryEntry {
+    fn from(n: &Notification) -> Self {
+        // duration_since returns Err if created_at is before UNIX_EPOCH; fall
+        // back to 0 rather than panicking.
+        let created_at_unix = n
+            .created_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            id: n.id,
+            app_name: n.app_name.clone(),
+            summary: n.summary.clone(),
+            body: n.body.clone(),
+            urgency: n.urgency,
+            created_at_unix,
+        }
+    }
+}
+
+/// Snapshot of daemon state for the `status` IPC command.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StatusInfo {
+    /// Whether Do-Not-Disturb mode is currently active.
+    pub dnd: bool,
+    /// Number of notifications currently displayed.
+    pub active: usize,
+    /// Number of notifications waiting in the overflow queue.
+    pub waiting: usize,
+    /// Number of entries in the history ring.
+    pub history: usize,
+    /// Whether the notification center panel is currently visible.
+    pub center_visible: bool,
+}
+
 /// Commands sent from the D-Bus layer to Core.
 #[derive(Debug)]
 pub enum DbusCmd {
@@ -288,6 +340,16 @@ pub enum UiCommand {
     ConfigChanged(Arc<Config>),
     /// Shut down the UI cleanly.
     Shutdown,
+    /// Show or hide the notification center panel with the given history entries.
+    ///
+    /// Pushed on every `ToggleCenter` and after any history mutation while the
+    /// center is visible.
+    SetCenter {
+        /// Whether the center panel is now visible.
+        visible: bool,
+        /// History entries ordered newest-first, as stripped `DisplayNotification`s.
+        entries: Arc<[DisplayNotification]>,
+    },
 }
 
 /// Events sent from the UI layer back to Core.
@@ -314,21 +376,49 @@ pub enum UiEvent {
     },
     /// The set of connected Wayland outputs changed.
     OutputsChanged,
+    /// The user clicked the '×' button on a history entry in the center panel.
+    HistoryRemoveRequested(u32),
+    /// The user clicked 'clear all' in the notification center panel.
+    ClearHistoryRequested,
 }
 
 /// A config-change event carrying the newly loaded config.
 #[derive(Debug, Clone)]
 pub struct ConfigEvent(pub Arc<Config>);
 
-/// IPC commands (Phase 2 placeholder).
-#[derive(Debug, Clone)]
+/// IPC commands sent from the control socket to Core (Phase 2).
+///
+/// Variants that carry a `reply` sender use a bounded(1) channel so Core can
+/// reply without blocking.  Fire-and-forget variants have no reply.
+#[derive(Debug)]
 pub enum IpcCmd {
-    /// Dismiss all active notifications.
+    /// Dismiss all currently active notifications.
     DismissAll,
-    /// Retrieve notification history.
-    History,
-    /// Toggle Do-Not-Disturb mode.
-    ToggleDnd,
-    /// Toggle the notification center panel.
-    ToggleCenter,
+    /// Close a specific notification by ID (reason: Dismissed).
+    Close {
+        /// The notification ID to close.
+        id: u32,
+    },
+    /// Retrieve the notification history, newest first.
+    History {
+        /// Reply channel — Core sends the history entries here.
+        reply: ReplyTx<Vec<HistoryEntry>>,
+    },
+    /// Clear the entire notification history.
+    ClearHistory,
+    /// Toggle Do-Not-Disturb mode; replies with the **new** DND state.
+    ToggleDnd {
+        /// Reply channel — Core sends the new DND state here.
+        reply: ReplyTx<bool>,
+    },
+    /// Toggle the notification center panel; replies with the **new** visibility.
+    ToggleCenter {
+        /// Reply channel — Core sends the new visibility here.
+        reply: ReplyTx<bool>,
+    },
+    /// Query the current daemon status.
+    Status {
+        /// Reply channel — Core sends a [`StatusInfo`] snapshot here.
+        reply: ReplyTx<StatusInfo>,
+    },
 }

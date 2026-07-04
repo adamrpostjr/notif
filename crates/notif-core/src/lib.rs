@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use notif_types::config::Config;
 use notif_types::{
-    CloseReason, ConfigEvent, DbusCmd, DbusSignal, DisplayNotification, ImageSource, IpcCmd,
-    NewNotification, Notification, Timeout, UiCommand, UiEvent, Urgency,
+    CloseReason, ConfigEvent, DbusCmd, DbusSignal, DisplayNotification, HistoryEntry, ImageSource,
+    IpcCmd, NewNotification, Notification, StatusInfo, Timeout, UiCommand, UiEvent, Urgency,
 };
 
 // ── Clock abstraction (for testing) ──────────────────────────────────────────
@@ -77,6 +77,15 @@ pub struct Core<C: Clock> {
     waiting: VecDeque<Notification>,
     /// Closed-notification history; front = oldest.
     history: VecDeque<Notification>,
+    /// Do-Not-Disturb mode.  When on, non-Critical incoming notifications are
+    /// silently added to history instead of being displayed.
+    dnd: bool,
+    /// Whether the notification center panel is currently shown.
+    center_visible: bool,
+    /// Set to `true` whenever `history` changes (entries added, removed, or
+    /// cleared).  The async run loop reads and resets this flag to decide
+    /// whether to push a `UiCommand::SetCenter` update.
+    history_dirty: bool,
 }
 
 impl<C: Clock> Core<C> {
@@ -89,6 +98,9 @@ impl<C: Clock> Core<C> {
             active: Vec::new(),
             waiting: VecDeque::new(),
             history: VecDeque::new(),
+            dnd: false,
+            center_visible: false,
+            history_dirty: false,
         }
     }
 
@@ -155,6 +167,12 @@ impl<C: Clock> Core<C> {
     /// Process a `Notify` D-Bus call.
     ///
     /// Returns `(assigned_id, signals_to_emit, ui_command)`.
+    ///
+    /// **DND semantics**: while DND is active, non-Critical incoming
+    /// notifications that do not replace an existing active/waiting entry are
+    /// sent directly to history (image stripped, transient excluded) and are
+    /// never displayed.  Critical notifications and replacements of
+    /// active/waiting entries bypass DND.
     pub fn handle_notify(
         &mut self,
         n: Box<NewNotification>,
@@ -188,11 +206,21 @@ impl<C: Clock> Core<C> {
                 }
                 return (replaces_id, vec![], self.sync_cmd());
             }
+            // replaces_id not found in active or waiting (e.g. DND-hidden entry
+            // in history) → fall through and treat as a new notification.
         }
 
-        // New notification.
+        // Assign an ID to the incoming notification.
         let notification = self.assign_id(n);
         let id = notification.id;
+
+        // DND: non-Critical new notifications go straight to history without display.
+        if self.dnd && notification.urgency != Urgency::Critical {
+            // add_to_history handles transient exclusion and image stripping.
+            self.add_to_history(Arc::new(notification));
+            // Active list is unchanged; return an unmodified sync.
+            return (id, vec![], self.sync_cmd());
+        }
 
         if self.active.len() < self.config.max_visible {
             let deadline = self.compute_deadline(&notification, now);
@@ -363,9 +391,13 @@ impl<C: Clock> Core<C> {
 
         self.config = config.clone();
 
-        // Re-cap history.
+        // Re-cap history.  Mark dirty if any entries are evicted.
+        let pre_len = self.history.len();
         while self.history.len() > new_history_limit {
             self.history.pop_front();
+        }
+        if self.history.len() < pre_len {
+            self.history_dirty = true;
         }
 
         // Demote newest notifications if max_visible shrank.
@@ -402,6 +434,61 @@ impl<C: Clock> Core<C> {
         // slots must show them immediately rather than on the next event.
         self.promote_from_waiting(now);
         signals
+    }
+
+    // ── Handle IPC ToggleDnd ──────────────────────────────────────────────────
+
+    /// Toggle Do-Not-Disturb mode.  Returns the **new** DND state.
+    pub fn handle_toggle_dnd(&mut self) -> bool {
+        self.dnd = !self.dnd;
+        self.dnd
+    }
+
+    // ── Handle IPC ToggleCenter ───────────────────────────────────────────────
+
+    /// Toggle the notification center panel visibility.  Returns the **new**
+    /// visibility state.
+    pub fn handle_toggle_center(&mut self) -> bool {
+        self.center_visible = !self.center_visible;
+        self.center_visible
+    }
+
+    // ── Handle IPC History query ──────────────────────────────────────────────
+
+    /// Return the history ring as a `Vec<HistoryEntry>`, newest first.
+    pub fn handle_query_history(&self) -> Vec<HistoryEntry> {
+        self.history.iter().rev().map(HistoryEntry::from).collect()
+    }
+
+    // ── Handle IPC Status query ───────────────────────────────────────────────
+
+    /// Return a snapshot of the current daemon status.
+    pub fn handle_query_status(&self) -> StatusInfo {
+        StatusInfo {
+            dnd: self.dnd,
+            active: self.active.len(),
+            waiting: self.waiting.len(),
+            history: self.history.len(),
+            center_visible: self.center_visible,
+        }
+    }
+
+    // ── Handle IPC / UiEvent remove / clear history ───────────────────────────
+
+    /// Remove a single entry from history by ID.  No-op if the ID is not found.
+    pub fn handle_remove_history(&mut self, id: u32) {
+        if let Some(pos) = self.history.iter().position(|n| n.id == id) {
+            self.history.remove(pos);
+            self.history_dirty = true;
+        }
+    }
+
+    /// Empty the entire history ring.
+    pub fn handle_clear_history(&mut self) {
+        if !self.history.is_empty() {
+            self.history.clear();
+            self.history_dirty = true;
+        }
     }
 
     // ── Tick (expiry) ─────────────────────────────────────────────────────────
@@ -453,6 +540,31 @@ impl<C: Clock> Core<C> {
         UiCommand::Sync(Arc::from(display))
     }
 
+    // ── Center command ────────────────────────────────────────────────────────
+
+    /// Build a `UiCommand::SetCenter` with the current history, newest first.
+    pub fn center_cmd(&self) -> UiCommand {
+        let entries: Vec<DisplayNotification> = self
+            .history
+            .iter()
+            .rev()
+            .map(|n| DisplayNotification::new(n.clone()))
+            .collect();
+        UiCommand::SetCenter {
+            visible: self.center_visible,
+            entries: Arc::from(entries),
+        }
+    }
+
+    /// Return `true` and reset the dirty flag if history was mutated since the
+    /// last call to this method.  Used by the async run loop to decide whether
+    /// to push a `SetCenter` update.
+    pub fn take_history_dirty(&mut self) -> bool {
+        let dirty = self.history_dirty;
+        self.history_dirty = false;
+        dirty
+    }
+
     // ── Earliest deadline ─────────────────────────────────────────────────────
 
     /// The earliest expiry deadline across all active (non-paused) notifications.
@@ -466,6 +578,11 @@ impl<C: Clock> Core<C> {
 
     // ── History helpers ───────────────────────────────────────────────────────
 
+    /// Add a notification to the history ring.
+    ///
+    /// Transient notifications are silently dropped.  Raw image data is
+    /// stripped (it can be large and is not needed for display in the history
+    /// panel).  Sets `history_dirty` to `true` when an entry is actually added.
     fn add_to_history(&mut self, n: Arc<Notification>) {
         if n.transient {
             return;
@@ -480,6 +597,7 @@ impl<C: Clock> Core<C> {
         while self.history.len() > self.config.history_limit {
             self.history.pop_front();
         }
+        self.history_dirty = true;
     }
 
     // ── Promotion ─────────────────────────────────────────────────────────────
@@ -553,6 +671,16 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                 if let Err(e) = dbus_signal_tx.send(sig).await {
                     log::warn!("notif-core: dbus signal channel closed: {e}");
                 }
+            }
+        };
+    }
+
+    // Helper: push SetCenter if history was mutated and the center is visible.
+    macro_rules! push_center_if_dirty {
+        () => {
+            if core.take_history_dirty() && core.center_visible {
+                let c = core.center_cmd();
+                send_ui!(c);
             }
         };
     }
@@ -649,6 +777,7 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         let _ = reply.send(id).await;
                         send_signals!(signals);
                         send_ui!(ui_cmd);
+                        push_center_if_dirty!();
                     }
                     DbusCmd::Close { id, reply } => {
                         let signals = core.handle_close(id);
@@ -656,6 +785,7 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        push_center_if_dirty!();
                     }
                 }
                 rearm!();
@@ -669,26 +799,38 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        push_center_if_dirty!();
                     }
                     UiEvent::BodyClicked(id) => {
                         let signals = core.handle_body_click(id);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        push_center_if_dirty!();
                     }
                     UiEvent::ActionInvoked { id, key } => {
                         let signals = core.handle_action_invoked(id, key);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        push_center_if_dirty!();
                     }
                     UiEvent::HoverChanged { id, hovered } => {
                         core.handle_hover(id, hovered, now);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        // hover does not change history
                     }
                     UiEvent::OutputsChanged => {
                         // Nothing to do in core; UI handles relayout.
+                    }
+                    UiEvent::HistoryRemoveRequested(id) => {
+                        core.handle_remove_history(id);
+                        push_center_if_dirty!();
+                    }
+                    UiEvent::ClearHistoryRequested => {
+                        core.handle_clear_history();
+                        push_center_if_dirty!();
                     }
                 }
                 rearm!();
@@ -700,20 +842,51 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                 for cmd in cmds {
                     send_ui!(cmd);
                 }
+                push_center_if_dirty!();
                 rearm!();
             }
 
             Event::Ipc(ipc) => {
+                let now = core.clock.now();
                 match ipc {
                     IpcCmd::DismissAll => {
-                        let now = core.clock.now();
                         let signals = core.handle_dismiss_all(now);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
+                        push_center_if_dirty!();
                     }
-                    IpcCmd::History | IpcCmd::ToggleDnd | IpcCmd::ToggleCenter => {
-                        // Phase 2 placeholder — not yet implemented.
+                    IpcCmd::Close { id } => {
+                        let signals = core.handle_close(id);
+                        send_signals!(signals);
+                        let sync = core.sync_cmd();
+                        send_ui!(sync);
+                        push_center_if_dirty!();
+                    }
+                    IpcCmd::History { reply } => {
+                        let entries = core.handle_query_history();
+                        let _ = reply.send(entries).await;
+                    }
+                    IpcCmd::ClearHistory => {
+                        core.handle_clear_history();
+                        push_center_if_dirty!();
+                    }
+                    IpcCmd::ToggleDnd { reply } => {
+                        let new_state = core.handle_toggle_dnd();
+                        let _ = reply.send(new_state).await;
+                    }
+                    IpcCmd::ToggleCenter { reply } => {
+                        let new_state = core.handle_toggle_center();
+                        let _ = reply.send(new_state).await;
+                        // Always push SetCenter on toggle (regardless of history dirty).
+                        let center = core.center_cmd();
+                        send_ui!(center);
+                        // Clear dirty so push_center_if_dirty doesn't double-send.
+                        core.take_history_dirty();
+                    }
+                    IpcCmd::Status { reply } => {
+                        let status = core.handle_query_status();
+                        let _ = reply.send(status).await;
                     }
                 }
                 rearm!();
@@ -726,6 +899,7 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                 if changed {
                     let sync = core.sync_cmd();
                     send_ui!(sync);
+                    push_center_if_dirty!();
                 }
                 rearm!();
             }
@@ -861,7 +1035,7 @@ mod tests {
         core.active.iter().map(|a| a.n.summary.clone()).collect()
     }
 
-    // ── Tests ──────────────────────────────────────────────────────────────────
+    // ── Phase-1 tests (unchanged) ──────────────────────────────────────────────
 
     #[test]
     fn test_notify_assigns_id() {
@@ -1370,6 +1544,310 @@ mod tests {
             &signals[0]
         );
         assert!(core.active.is_empty());
+    }
+
+    // ── Phase-2 tests: DND semantics ───────────────────────────────────────────
+
+    #[test]
+    fn test_dnd_hides_normal_goes_to_history_image_stripped_no_signal_id_assigned() {
+        use notif_types::RawImage;
+        let mut core = make_core(default_config());
+        // Enable DND.
+        let new_state = core.handle_toggle_dnd();
+        assert!(new_state, "DND should now be on");
+
+        let raw = RawImage {
+            width: 1,
+            height: 1,
+            rowstride: 3,
+            has_alpha: false,
+            bits_per_sample: 8,
+            channels: 3,
+            data: vec![255, 0, 0],
+        };
+        let now = core.clock.now();
+        let n = simple_new_with(
+            "dnd-hidden",
+            Urgency::Normal,
+            Timeout::Default,
+            false,
+            false,
+            Some(ImageSource::Data(raw)),
+        );
+        let (id, signals, _cmd) = core.handle_notify(n, 0, now);
+
+        // ID must be assigned (non-zero).
+        assert!(id > 0, "id must be assigned");
+        // No signals emitted.
+        assert!(signals.is_empty(), "no signals emitted while DND");
+        // Not displayed.
+        assert!(core.active.is_empty(), "notification must not be active");
+        // In history.
+        assert_eq!(core.history.len(), 1, "notification must be in history");
+        // Image stripped.
+        let hist = core.history.front().unwrap();
+        assert!(hist.image.is_none(), "image must be stripped in history");
+        // History dirty.
+        assert!(core.take_history_dirty(), "history_dirty must be set");
+    }
+
+    #[test]
+    fn test_dnd_critical_bypass() {
+        let mut core = make_core(default_config());
+        // Enable DND.
+        core.handle_toggle_dnd();
+
+        let now = core.clock.now();
+        let n = simple_new_with(
+            "critical",
+            Urgency::Critical,
+            Timeout::Default,
+            false,
+            false,
+            None,
+        );
+        let (id, signals, _cmd) = core.handle_notify(n, 0, now);
+
+        assert!(id > 0, "id assigned");
+        assert!(
+            signals.is_empty(),
+            "no signals (critical has no automatic signal)"
+        );
+        // Critical bypasses DND — must appear in active.
+        assert_eq!(core.active.len(), 1, "critical shown despite DND");
+        assert!(core.history.is_empty(), "critical not added to history yet");
+    }
+
+    #[test]
+    fn test_toggle_dnd_replies_new_state() {
+        let mut core = make_core(default_config());
+
+        // Initially off.
+        assert!(!core.dnd);
+
+        let state1 = core.handle_toggle_dnd();
+        assert!(state1, "toggle from off → on");
+
+        let state2 = core.handle_toggle_dnd();
+        assert!(!state2, "toggle from on → off");
+    }
+
+    #[test]
+    fn test_dnd_transient_still_excluded() {
+        let mut core = make_core(default_config());
+        core.handle_toggle_dnd(); // DND on
+
+        let now = core.clock.now();
+        let n = simple_new_with(
+            "transient-dnd",
+            Urgency::Normal,
+            Timeout::Default,
+            true, // transient
+            false,
+            None,
+        );
+        let (id, _, _) = core.handle_notify(n, 0, now);
+        assert!(id > 0);
+        // Transient → not added to history even under DND.
+        assert!(
+            core.history.is_empty(),
+            "transient excluded from history even under DND"
+        );
+        assert!(
+            !core.take_history_dirty(),
+            "no history mutation for transient"
+        );
+    }
+
+    #[test]
+    fn test_replaces_dnd_hidden_id_treated_as_new() {
+        let mut core = make_core(default_config());
+        core.handle_toggle_dnd(); // DND on
+
+        let now = core.clock.now();
+        // First notification → DND-hidden, goes to history with id=1.
+        let (id1, _, _) = core.handle_notify(simple_new("hidden"), 0, now);
+        assert_eq!(id1, 1);
+        assert_eq!(core.history.len(), 1);
+
+        // Second notification with replaces_id=1 (the DND-hidden entry).
+        // id1 is not in active or waiting, so this is treated as a new notification.
+        let (id2, _, _) = core.handle_notify(simple_new("replacement"), id1, now);
+        // Fresh id assigned (since 1 is not in active/waiting).
+        assert_ne!(id2, id1, "must be treated as new notification");
+        // Also goes to history under DND.
+        assert_eq!(core.history.len(), 2, "both in history");
+    }
+
+    // ── Phase-2 tests: history query / remove / clear ──────────────────────────
+
+    #[test]
+    fn test_history_query_newest_first() {
+        let mut core = make_core(default_config());
+        let ids: Vec<u32> = (0..3)
+            .map(|i| {
+                let id = notify(&mut core, &format!("n{i}"));
+                core.handle_dismiss(id);
+                id
+            })
+            .collect();
+
+        // History ring: front = oldest (n0), back = newest (n2).
+        let entries = core.handle_query_history();
+        assert_eq!(entries.len(), 3);
+        // Newest first: n2, n1, n0.
+        assert_eq!(entries[0].id, ids[2], "newest first");
+        assert_eq!(entries[1].id, ids[1]);
+        assert_eq!(entries[2].id, ids[0], "oldest last");
+    }
+
+    #[test]
+    fn test_remove_from_history() {
+        let mut core = make_core(default_config());
+        let id1 = notify(&mut core, "keep");
+        core.handle_dismiss(id1);
+        let id2 = notify(&mut core, "remove-me");
+        core.handle_dismiss(id2);
+        assert_eq!(core.history.len(), 2);
+
+        core.handle_remove_history(id2);
+
+        assert_eq!(core.history.len(), 1);
+        assert!(core.history.front().map(|n| n.id == id1).unwrap_or(false));
+        assert!(core.take_history_dirty(), "dirty after remove");
+    }
+
+    #[test]
+    fn test_remove_from_history_unknown_id_is_noop() {
+        let mut core = make_core(default_config());
+        let id = notify(&mut core, "entry");
+        core.handle_dismiss(id);
+        core.take_history_dirty(); // reset flag
+
+        core.handle_remove_history(9999);
+        assert_eq!(core.history.len(), 1, "unchanged");
+        assert!(!core.take_history_dirty(), "not dirty for unknown id");
+    }
+
+    #[test]
+    fn test_clear_history() {
+        let mut core = make_core(default_config());
+        for _ in 0..3 {
+            let id = notify(&mut core, "entry");
+            core.handle_dismiss(id);
+        }
+        assert_eq!(core.history.len(), 3);
+
+        core.handle_clear_history();
+        assert!(core.history.is_empty(), "history cleared");
+        assert!(core.take_history_dirty(), "dirty after clear");
+    }
+
+    #[test]
+    fn test_clear_history_empty_not_dirty() {
+        let mut core = make_core(default_config());
+        core.handle_clear_history(); // already empty
+        assert!(!core.take_history_dirty(), "not dirty when already empty");
+    }
+
+    // ── Phase-2 tests: center tracking ────────────────────────────────────────
+
+    #[test]
+    fn test_toggle_center_replies_new_state() {
+        let mut core = make_core(default_config());
+        assert!(!core.center_visible);
+
+        let v1 = core.handle_toggle_center();
+        assert!(v1, "toggle from off → on");
+        assert!(core.center_visible);
+
+        let v2 = core.handle_toggle_center();
+        assert!(!v2, "toggle from on → off");
+        assert!(!core.center_visible);
+    }
+
+    #[test]
+    fn test_center_cmd_entries_newest_first() {
+        let mut core = make_core(default_config());
+
+        let id1 = notify(&mut core, "oldest");
+        core.handle_dismiss(id1);
+        let id2 = notify(&mut core, "newer");
+        core.handle_dismiss(id2);
+        let id3 = notify(&mut core, "newest");
+        core.handle_dismiss(id3);
+
+        core.handle_toggle_center(); // visible = true
+
+        let cmd = core.center_cmd();
+        match cmd {
+            UiCommand::SetCenter { visible, entries } => {
+                assert!(visible);
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].notification.id, id3, "newest first");
+                assert_eq!(entries[2].notification.id, id1, "oldest last");
+            }
+            _ => panic!("expected SetCenter"),
+        }
+    }
+
+    #[test]
+    fn test_history_dirty_set_on_add_via_dismiss() {
+        let mut core = make_core(default_config());
+        core.take_history_dirty(); // reset
+
+        let id = notify(&mut core, "n");
+        core.handle_dismiss(id);
+        assert!(
+            core.take_history_dirty(),
+            "dirty after dismiss adds to history"
+        );
+    }
+
+    #[test]
+    fn test_history_dirty_set_after_config_recap() {
+        let mut core = make_core(Arc::new(Config {
+            history_limit: 10,
+            max_visible: 20,
+            ..Config::default()
+        }));
+        for _ in 0..5 {
+            let id = notify(&mut core, "entry");
+            core.handle_dismiss(id);
+        }
+        core.take_history_dirty(); // reset after setup
+
+        // Reduce history_limit — should evict entries and set dirty.
+        let new_cfg = Config {
+            history_limit: 2,
+            max_visible: 20,
+            ..Config::default()
+        };
+        core.handle_config(Arc::new(new_cfg), core.clock.now());
+        assert!(core.take_history_dirty(), "dirty after history re-cap");
+    }
+
+    #[test]
+    fn test_history_dirty_not_set_when_no_recap_needed() {
+        let mut core = make_core(Arc::new(Config {
+            history_limit: 10,
+            max_visible: 20,
+            ..Config::default()
+        }));
+        for _ in 0..3 {
+            let id = notify(&mut core, "entry");
+            core.handle_dismiss(id);
+        }
+        core.take_history_dirty(); // reset
+
+        // Increase limit — no eviction, should NOT set dirty.
+        let new_cfg = Config {
+            history_limit: 20,
+            max_visible: 20,
+            ..Config::default()
+        };
+        core.handle_config(Arc::new(new_cfg), core.clock.now());
+        assert!(!core.take_history_dirty(), "not dirty when no recap needed");
     }
 
     // ── Async smoke test ───────────────────────────────────────────────────────

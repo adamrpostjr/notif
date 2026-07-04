@@ -91,9 +91,6 @@ fn main() -> Result<()> {
     let (config_tx, config_rx): (Sender<ConfigEvent>, Receiver<ConfigEvent>) = unbounded();
     let (ipc_tx, ipc_rx): (Sender<IpcCmd>, Receiver<IpcCmd>) = unbounded();
 
-    // Keep ipc_tx alive so ipc_rx does not immediately close
-    let _ipc_tx = ipc_tx;
-
     // Set up Ctrl-C handler — sends Shutdown to UI
     {
         let ui_cmd_tx_ctrlc = ui_cmd_tx.clone();
@@ -140,6 +137,17 @@ fn main() -> Result<()> {
         // Spawn config watcher task
         let _config_task = ex.spawn(async move {
             notif_config::watch(config_path, config_tx).await;
+        });
+
+        // Spawn IPC socket task.  IPC failures are logged-and-degraded: a bind
+        // error (e.g. $XDG_RUNTIME_DIR unset) or unexpected socket error must
+        // not kill the daemon.
+        let ipc_tx_for_task = ipc_tx.clone();
+        let _ipc_task = ex.spawn(async move {
+            match notif_ipc::run(ipc_tx_for_task).await {
+                Ok(()) => log::info!("notif-ipc: exited cleanly"),
+                Err(e) => log::error!("notif-ipc: {e}"),
+            }
         });
 
         // Run Wayland UI in the foreground (returns when done)

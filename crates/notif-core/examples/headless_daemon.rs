@@ -63,6 +63,10 @@ fn main() {
                         println!("SHUTDOWN");
                         break;
                     }
+                    UiCommand::SetCenter { visible, entries } => {
+                        // Phase 2: center panel rendering not yet implemented here.
+                        println!("SET_CENTER(visible={visible}, entries={})", entries.len());
+                    }
                 }
             }
         },

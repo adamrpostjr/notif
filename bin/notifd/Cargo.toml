@@ -17,6 +17,7 @@ notif-core = { path = "../../crates/notif-core" }
 notif-dbus = { path = "../../crates/notif-dbus" }
 notif-wl = { path = "../../crates/notif-wl" }
 notif-render = { path = "../../crates/notif-render" }
+notif-ipc = { path = "../../crates/notif-ipc" }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
