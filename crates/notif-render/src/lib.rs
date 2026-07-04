@@ -5,6 +5,9 @@
 //! Buffer format: ARGB8888 premultiplied, little-endian memory order (bytes: B, G, R, A).
 //! This matches `wl_shm::Format::Argb8888`.
 
+pub mod skia_renderer;
+pub use skia_renderer::SkiaRenderer;
+
 use notif_types::{DisplayNotification, Urgency, config::Config};
 
 // ── Public geometry types ─────────────────────────────────────────────────────

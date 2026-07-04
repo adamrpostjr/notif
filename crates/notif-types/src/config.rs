@@ -175,6 +175,9 @@ pub struct Config {
     pub history_limit: usize,
     /// Whether to process HTML/Pango markup in notification bodies.
     pub body_markup: bool,
+    /// Icon theme name for freedesktop icon lookup.
+    #[serde(default)]
+    pub icon_theme: Option<String>,
 }
 
 impl Default for Config {
@@ -196,6 +199,7 @@ impl Default for Config {
             output: None,
             history_limit: 100,
             body_markup: true,
+            icon_theme: None,
         }
     }
 }

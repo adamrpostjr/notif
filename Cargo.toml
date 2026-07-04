@@ -29,6 +29,10 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = "0.3"
+anyhow = "1"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+async-executor = "1"
+ctrlc = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

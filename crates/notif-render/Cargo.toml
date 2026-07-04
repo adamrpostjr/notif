@@ -6,8 +6,17 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+default = ["svg"]
+svg = ["dep:resvg"]
+
 [dependencies]
 notif-types = { path = "../notif-types" }
 notif-config = { path = "../notif-config" }
 log = { workspace = true }
 thiserror = { workspace = true }
+tiny-skia = "0.12"
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "fontconfig", "swash"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+resvg = { version = "0.47", optional = true }
+freedesktop-icons = "0.4"
