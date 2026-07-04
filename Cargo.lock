@@ -1102,6 +1102,12 @@ dependencies = [
 [[package]]
 name = "notifctl"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "notif-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "notifd"
