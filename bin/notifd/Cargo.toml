@@ -1,0 +1,11 @@
+[package]
+name = "notifd"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "notifd"
+path = "src/main.rs"

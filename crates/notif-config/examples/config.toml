@@ -1,0 +1,70 @@
+# notif configuration file
+# All values shown are defaults
+
+# Corner to anchor the notification stack
+# Options: top_left, top_right, bottom_left, bottom_right
+anchor = "top_right"
+
+# Horizontal margin from screen edge (pixels)
+margin_x = 12
+
+# Vertical margin from screen edge (pixels)
+margin_y = 12
+
+# Gap between notifications (pixels)
+gap = 8
+
+# Maximum notification width (pixels)
+max_width = 400
+
+# Maximum notification height (pixels)
+max_height = 200
+
+# Maximum number of notifications visible at once
+max_visible = 5
+
+# Font settings
+font_family = "sans-serif"
+font_size = 13.0
+
+# Icon size (pixels)
+icon_size = 48
+
+# Wayland output name to display on (null = focused output)
+# output = "DP-1"
+
+# Number of notifications to keep in history
+history_limit = 100
+
+# Process HTML/Pango markup in notification bodies
+body_markup = true
+
+# Low urgency style
+[low]
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+border_color = "#313244"
+border_width = 1
+corner_radius = 8
+default_timeout_ms = 5000
+ignore_timeout = false
+
+# Normal urgency style
+[normal]
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+border_color = "#89b4fa"
+border_width = 1
+corner_radius = 8
+default_timeout_ms = 8000
+ignore_timeout = false
+
+# Critical urgency style
+[critical]
+background = "#1e1e2e"
+foreground = "#f38ba8"
+border_color = "#f38ba8"
+border_width = 2
+corner_radius = 8
+default_timeout_ms = 0
+ignore_timeout = true

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/notif-types",
+    "crates/notif-config",
+    "crates/notif-dbus",
+    "crates/notif-core",
+    "crates/notif-render",
+    "crates/notif-wl",
+    "crates/notif-ipc",
+    "bin/notifd",
+    "bin/notifctl",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.2"
+async-channel = "2"
+async-io = "2"
+futures-lite = "2"
+inotify = { version = "0.11", default-features = false }
+thiserror = "2"
+log = "0.4"
+zvariant = "5"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"

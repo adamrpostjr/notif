@@ -1,0 +1,11 @@
+[package]
+name = "notifctl"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "notifctl"
+path = "src/main.rs"
