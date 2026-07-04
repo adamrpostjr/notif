@@ -5,3 +5,9 @@ edition = "2024"
 
 [lints]
 workspace = true
+
+[dependencies]
+notif-types = { path = "../notif-types" }
+notif-config = { path = "../notif-config" }
+log = { workspace = true }
+thiserror = { workspace = true }
