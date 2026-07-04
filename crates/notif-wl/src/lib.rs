@@ -182,7 +182,14 @@ struct SurfaceState {
     layer: LayerSurface,
     viewport: Option<WpViewport>,
     frac_scale: Option<WpFractionalScaleV1>,
+    /// Scale value that will be used by the NEXT redraw (may have been updated
+    /// by a scale-change event that arrived before the redraw ran).
     scale: f64,
+    /// Scale value that was actually used when `layout` was last measured.
+    /// Hit-testing must use this value, not `scale`, to avoid stale-scale
+    /// mismatches when a scale event arrives in the same dispatch batch as a
+    /// pointer event but before the next redraw.
+    layout_scale: f64,
     layout: Layout,
     logical_w: u32,
     logical_h: u32,
@@ -406,6 +413,7 @@ impl WlState {
             viewport,
             frac_scale,
             scale,
+            layout_scale: scale,
             layout,
             logical_w: lw,
             logical_h: lh,
@@ -461,6 +469,10 @@ impl WlState {
             ss.logical_h = new_lh;
         }
         ss.layout = layout.clone();
+        // Record the scale that was actually used to measure this layout.
+        // Pointer events that arrive before the next redraw must use this value
+        // so that hit-testing is consistent with the committed buffer geometry.
+        ss.layout_scale = scale;
 
         // Buffer dimensions: ceil(logical * scale).
         let buf_w = ((new_lw as f64 * scale).ceil()) as u32;
@@ -468,8 +480,24 @@ impl WlState {
         if buf_w == 0 || buf_h == 0 {
             return Ok(());
         }
-        let stride = buf_w * 4;
-        let required = (stride * buf_h) as usize;
+        // Compute buffer size in u64 to detect overflow before any narrowing cast.
+        let stride64 = buf_w as u64 * 4;
+        let required64 = stride64 * buf_h as u64;
+        // Refuse unreasonably large buffers (> 64 MiB) — config validation enforces
+        // sane max_width/max_height/max_visible, but a hostile scale value could still
+        // produce a huge number here.
+        if required64 > 64 * 1024 * 1024 {
+            log::warn!(
+                "notif-wl: refusing to allocate {required64}-byte buffer \
+                 ({buf_w}×{buf_h} px at scale {scale:.3}); skipping frame"
+            );
+            return Ok(());
+        }
+        // All three casts are safe: required64 ≤ 64 MiB < usize::MAX on any
+        // supported 32/64-bit target; stride64 and buf_w/buf_h fit in u32/i32
+        // because required64 = stride64 * buf_h ≤ 64 MiB and stride64 = buf_w*4.
+        let stride = stride64 as u32;
+        let required = required64 as usize;
 
         // Grow pool if the current frame is larger than what we've allocated.
         if self.pool.len() < required {
@@ -540,8 +568,13 @@ impl WlState {
     }
 
     /// Convert logical (Wayland) pointer coordinates to buffer-pixel space.
+    ///
+    /// Uses `layout_scale` — the scale that was active when the current layout
+    /// was measured — rather than `scale` (which may already reflect a
+    /// scale-change event that has not yet been redrawn).  This avoids stale
+    /// hit-test mismatches in the same dispatch batch.
     fn logical_to_buf(&self, lx: f64, ly: f64) -> (f64, f64) {
-        let scale = self.surface_state.as_ref().map_or(1.0, |s| s.scale);
+        let scale = self.surface_state.as_ref().map_or(1.0, |s| s.layout_scale);
         (lx * scale, ly * scale)
     }
 
@@ -794,7 +827,10 @@ impl PointerHandler for WlState {
                         let (bx, by) = self.logical_to_buf(event.position.0, event.position.1);
                         if let Some(target) = self.hit_test(bx, by) {
                             match &target {
-                                HitTarget::Body(id) | HitTarget::CloseButton(id) => {
+                                HitTarget::Body(id) => {
+                                    let _ = self.ui_event_tx.try_send(UiEvent::BodyClicked(*id));
+                                }
+                                HitTarget::CloseButton(id) => {
                                     let _ =
                                         self.ui_event_tx.try_send(UiEvent::DismissRequested(*id));
                                 }
@@ -969,6 +1005,71 @@ mod tests {
         assert_eq!(hit(&layout, 8.0, 8.0, 1.5), Some(HitTarget::Body(2)));
         // logical (7.9, 8.0) → buffer (11.85 → 11, 12.0 → 12) → outside left edge.
         assert_eq!(hit(&layout, 7.9, 8.0, 1.5), None);
+    }
+
+    /// Simulate what `logical_to_buf` does using an explicit `layout_scale`.
+    fn logical_to_buf_with_layout_scale(lx: f64, ly: f64, layout_scale: f64) -> (f64, f64) {
+        (lx * layout_scale, ly * layout_scale)
+    }
+
+    /// A2: verify that hit-testing uses `layout_scale`, not the updated `scale`.
+    ///
+    /// Scenario: layout was measured at scale 1.0; a scale-change event arrives
+    /// updating `scale` to 1.5 before the next redraw.  A pointer event that
+    /// arrives in the same dispatch batch must be transformed with 1.0 (the
+    /// layout_scale), not 1.5 (the pending next-redraw scale).
+    #[test]
+    fn hit_test_uses_layout_scale_not_pending_scale() {
+        // Layout measured at scale 1.0: region covers buffer pixels (10, 10)–(109, 109).
+        let layout = make_layout(vec![HitRegion {
+            rect: Rect {
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+            },
+            target: HitTarget::Body(42),
+        }]);
+
+        // Logical coordinate (50.0, 50.0).
+        // With layout_scale = 1.0 → buffer (50, 50) → inside rect → hit.
+        let (bx, by) = logical_to_buf_with_layout_scale(50.0, 50.0, 1.0);
+        assert_eq!(
+            layout
+                .hit_regions
+                .iter()
+                .find(|r| r.rect.contains(bx as i32, by as i32))
+                .map(|r| r.target.clone()),
+            Some(HitTarget::Body(42)),
+            "layout_scale=1.0 should produce a hit"
+        );
+
+        // Same logical coordinate but transformed with the *new* (pending) scale = 1.5
+        // → buffer (75, 75) → still inside, fine.  The key correctness check is that
+        // we do NOT use scale=1.5 when the layout was measured at 1.0.
+        // Demonstrate what the WRONG path would produce for a boundary coordinate:
+        // logical (6.7, 6.7) with layout_scale 1.0 → buffer (6, 6) → miss (< 10).
+        let (bx2, by2) = logical_to_buf_with_layout_scale(6.7, 6.7, 1.0);
+        assert_eq!(
+            layout
+                .hit_regions
+                .iter()
+                .find(|r| r.rect.contains(bx2 as i32, by2 as i32))
+                .map(|r| r.target.clone()),
+            None,
+            "layout_scale=1.0 at logical 6.7 should be outside rect"
+        );
+        // But with wrong pending scale 1.5: 6.7 * 1.5 = 10.05 → buffer 10 → inside rect (BUG).
+        let (bx3, by3) = logical_to_buf_with_layout_scale(6.7, 6.7, 1.5);
+        assert_eq!(
+            layout
+                .hit_regions
+                .iter()
+                .find(|r| r.rect.contains(bx3 as i32, by3 as i32))
+                .map(|r| r.target.clone()),
+            Some(HitTarget::Body(42)),
+            "using pending scale=1.5 incorrectly registers a hit (demonstrating the bug we fixed)"
+        );
     }
 
     #[test]

@@ -56,14 +56,29 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
             message: "max_visible must be at least 1".to_owned(),
         });
     }
+    if c.max_visible > 64 {
+        return Err(ConfigError::Validation {
+            message: format!("max_visible must be at most 64, got {}", c.max_visible),
+        });
+    }
     if c.max_width == 0 {
         return Err(ConfigError::Validation {
             message: "max_width must be at least 1".to_owned(),
         });
     }
+    if c.max_width > 8192 {
+        return Err(ConfigError::Validation {
+            message: format!("max_width must be at most 8192, got {}", c.max_width),
+        });
+    }
     if c.max_height == 0 {
         return Err(ConfigError::Validation {
             message: "max_height must be at least 1".to_owned(),
+        });
+    }
+    if c.max_height > 8192 {
+        return Err(ConfigError::Validation {
+            message: format!("max_height must be at most 8192, got {}", c.max_height),
         });
     }
     Ok(())
@@ -207,6 +222,74 @@ mod tests {
         assert_eq!(config.max_visible, 3);
         assert_eq!(config.anchor, AnchorCorner::TopRight);
         assert_eq!(config.margin_x, 12);
+    }
+
+    // ── A3: config upper-bound tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_max_width_upper_bound_rejected() {
+        let cfg = Config {
+            max_width: 9000,
+            ..Config::default()
+        };
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(ConfigError::Validation { message }) if message.contains("8192")),
+            "expected validation error mentioning 8192, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_width_boundary_accepted() {
+        let cfg = Config {
+            max_width: 8192,
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok(), "max_width=8192 should be accepted");
+    }
+
+    #[test]
+    fn test_max_height_upper_bound_rejected() {
+        let cfg = Config {
+            max_height: 9000,
+            ..Config::default()
+        };
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(ConfigError::Validation { message }) if message.contains("8192")),
+            "expected validation error mentioning 8192, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_height_boundary_accepted() {
+        let cfg = Config {
+            max_height: 8192,
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok(), "max_height=8192 should be accepted");
+    }
+
+    #[test]
+    fn test_max_visible_upper_bound_rejected() {
+        let cfg = Config {
+            max_visible: 65,
+            ..Config::default()
+        };
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(ConfigError::Validation { message }) if message.contains("64")),
+            "expected validation error mentioning 64, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_visible_boundary_accepted() {
+        let cfg = Config {
+            max_visible: 64,
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok(), "max_visible=64 should be accepted");
     }
 
     #[test]

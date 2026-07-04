@@ -351,6 +351,29 @@ impl<C: Clock> Core<C> {
         signals
     }
 
+    // ── Handle UI BodyClicked ─────────────────────────────────────────────────
+
+    /// Process a `BodyClicked` UI event.
+    ///
+    /// If the notification has an action with key `"default"`, this delegates to
+    /// [`handle_action_invoked`] (which emits `ActionInvoked` before
+    /// `NotificationClosed` and respects the `resident` flag).  If there is no
+    /// `"default"` action, this behaves exactly like [`handle_dismiss`].
+    pub fn handle_body_click(&mut self, id: u32) -> Vec<DbusSignal> {
+        let has_default = self
+            .active
+            .iter()
+            .find(|a| a.n.id == id)
+            .map(|a| a.n.actions.iter().any(|act| act.key == "default"))
+            .unwrap_or(false);
+
+        if has_default {
+            self.handle_action_invoked(id, "default".into())
+        } else {
+            self.handle_dismiss(id)
+        }
+    }
+
     // ── Handle UI HoverChanged ────────────────────────────────────────────────
 
     /// Process a `HoverChanged` UI event (pause/resume the expiry timer).
@@ -685,6 +708,12 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         let sync = core.sync_cmd();
                         send_ui!(sync);
                     }
+                    UiEvent::BodyClicked(id) => {
+                        let signals = core.handle_body_click(id);
+                        send_signals!(signals);
+                        let sync = core.sync_cmd();
+                        send_ui!(sync);
+                    }
                     UiEvent::ActionInvoked { id, key } => {
                         let signals = core.handle_action_invoked(id, key);
                         send_signals!(signals);
@@ -828,6 +857,40 @@ mod tests {
     fn notify(core: &mut Core<MockClock>, summary: &str) -> u32 {
         let now = core.clock.now();
         let (id, _, _) = core.handle_notify(simple_new(summary), 0, now);
+        id
+    }
+
+    fn simple_new_with_actions(
+        summary: &str,
+        actions: Vec<notif_types::Action>,
+        resident: bool,
+    ) -> Box<NewNotification> {
+        Box::new(NewNotification {
+            app_name: "test".into(),
+            app_icon: String::new(),
+            summary: summary.into(),
+            body: String::new(),
+            actions,
+            urgency: Urgency::Normal,
+            expire_timeout: Timeout::Default,
+            image: None,
+            transient: false,
+            resident,
+            category: None,
+            desktop_entry: None,
+            raw_hints: Default::default(),
+        })
+    }
+
+    fn notify_with_actions(
+        core: &mut Core<MockClock>,
+        summary: &str,
+        actions: Vec<notif_types::Action>,
+        resident: bool,
+    ) -> u32 {
+        let now = core.clock.now();
+        let (id, _, _) =
+            core.handle_notify(simple_new_with_actions(summary, actions, resident), 0, now);
         id
     }
 
@@ -1252,6 +1315,99 @@ mod tests {
         assert!(signals.is_empty());
         assert_eq!(core.waiting.len(), 1);
         assert_eq!(core.waiting[0].summary, "waiting-updated");
+    }
+
+    // ── A1: body-click / default-action tests ─────────────────────────────────
+
+    #[test]
+    fn test_body_click_with_default_action_invokes_and_closes() {
+        let mut core = make_core(default_config());
+        let actions = vec![notif_types::Action {
+            key: "default".into(),
+            label: "Open".into(),
+        }];
+        let id = notify_with_actions(&mut core, "clickable", actions, false);
+        let signals = core.handle_body_click(id);
+        // ActionInvoked BEFORE NotificationClosed.
+        assert_eq!(signals.len(), 2, "expected exactly 2 signals");
+        assert!(
+            matches!(&signals[0], DbusSignal::ActionInvoked { id: sid, action_key } if *sid == id && action_key == "default"),
+            "first signal must be ActionInvoked{{default}}, got: {:?}",
+            &signals[0]
+        );
+        assert!(
+            matches!(&signals[1], DbusSignal::NotificationClosed { id: sid, reason: CloseReason::Dismissed } if *sid == id),
+            "second signal must be NotificationClosed{{Dismissed}}, got: {:?}",
+            &signals[1]
+        );
+        assert!(core.active.is_empty(), "notification must be removed");
+    }
+
+    #[test]
+    fn test_body_click_with_default_action_resident_stays() {
+        let mut core = make_core(default_config());
+        let actions = vec![notif_types::Action {
+            key: "default".into(),
+            label: "Open".into(),
+        }];
+        let id = notify_with_actions(&mut core, "resident-click", actions, true);
+        let signals = core.handle_body_click(id);
+        // Only ActionInvoked — no close for resident.
+        assert_eq!(
+            signals.len(),
+            1,
+            "expected 1 signal for resident notification"
+        );
+        assert!(
+            matches!(&signals[0], DbusSignal::ActionInvoked { id: sid, action_key } if *sid == id && action_key == "default"),
+            "signal must be ActionInvoked{{default}}, got: {:?}",
+            &signals[0]
+        );
+        assert_eq!(
+            core.active.len(),
+            1,
+            "resident notification must remain active"
+        );
+    }
+
+    #[test]
+    fn test_body_click_no_default_action_plain_dismiss() {
+        let mut core = make_core(default_config());
+        // Notification has an action, but NOT named "default".
+        let actions = vec![notif_types::Action {
+            key: "reply".into(),
+            label: "Reply".into(),
+        }];
+        let id = notify_with_actions(&mut core, "no-default", actions, false);
+        let signals = core.handle_body_click(id);
+        // Plain dismiss: only NotificationClosed, no ActionInvoked.
+        assert_eq!(signals.len(), 1, "expected 1 signal (plain dismiss)");
+        assert!(
+            matches!(&signals[0], DbusSignal::NotificationClosed { id: sid, reason: CloseReason::Dismissed } if *sid == id),
+            "signal must be NotificationClosed{{Dismissed}}, got: {:?}",
+            &signals[0]
+        );
+        assert!(core.active.is_empty(), "notification must be removed");
+    }
+
+    #[test]
+    fn test_close_button_with_default_action_no_action_invoked() {
+        let mut core = make_core(default_config());
+        // Notification has a "default" action — close button must NOT invoke it.
+        let actions = vec![notif_types::Action {
+            key: "default".into(),
+            label: "Open".into(),
+        }];
+        let id = notify_with_actions(&mut core, "close-btn-test", actions, false);
+        let signals = core.handle_dismiss(id);
+        // handle_dismiss (close-button path) must emit only NotificationClosed, no ActionInvoked.
+        assert_eq!(signals.len(), 1, "expected 1 signal from close-button path");
+        assert!(
+            matches!(&signals[0], DbusSignal::NotificationClosed { id: sid, reason: CloseReason::Dismissed } if *sid == id),
+            "signal must be NotificationClosed{{Dismissed}}, got: {:?}",
+            &signals[0]
+        );
+        assert!(core.active.is_empty());
     }
 
     // ── Async smoke test ───────────────────────────────────────────────────────

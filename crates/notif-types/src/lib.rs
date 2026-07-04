@@ -268,6 +268,9 @@ pub enum UiCommand {
 pub enum UiEvent {
     /// The user dismissed a notification.
     DismissRequested(u32),
+    /// The user clicked the notification body (not the close button).
+    /// Core decides whether this invokes the "default" action or dismisses.
+    BodyClicked(u32),
     /// The user invoked an action on a notification.
     ActionInvoked {
         /// The notification ID.
