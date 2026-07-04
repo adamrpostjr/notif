@@ -326,9 +326,6 @@ struct CenterEntryGeometry {
     meta_h: f32,
     /// Pre-shaped body line (one line, ellipsized); empty buffer → no runs.
     body_buffer: Buffer,
-    /// Shaped height of the body line; stored for future layout use.
-    #[allow(dead_code)]
-    body_h: f32,
     has_body: bool,
 }
 
@@ -669,18 +666,11 @@ impl SkiaRenderer {
 
     /// Format a relative age string given the creation time and current time.
     ///
-    /// Results: "just now", "Xm ago", "Xh ago", "Xd ago".
+    /// Delegates to [`notif_types::relative_age`]; results: `"Xs"`, `"Xm"`,
+    /// `"Xh"`, `"Xd"`.
     fn format_relative_age(created_at: SystemTime, now: SystemTime) -> String {
         let secs = now.duration_since(created_at).unwrap_or_default().as_secs();
-        if secs < 60 {
-            "just now".to_owned()
-        } else if secs < 3600 {
-            format!("{}m ago", secs / 60)
-        } else if secs < 86400 {
-            format!("{}h ago", secs / 3600)
-        } else {
-            format!("{}d ago", secs / 86400)
-        }
+        notif_types::relative_age(secs)
     }
 
     /// Build the center panel cache (header + per-entry geometries).
@@ -850,7 +840,6 @@ impl SkiaRenderer {
                 meta_buffer: meta_buf,
                 meta_h,
                 body_buffer: body_buf,
-                body_h,
                 has_body,
             });
 

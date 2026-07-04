@@ -11,6 +11,7 @@ name = "notifctl"
 path = "src/main.rs"
 
 [dependencies]
+notif-ipc = { path = "../../crates/notif-ipc" }
 notif-types = { path = "../../crates/notif-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }

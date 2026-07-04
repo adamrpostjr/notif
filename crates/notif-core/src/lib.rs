@@ -785,7 +785,6 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         let _ = reply.send(id).await;
                         send_signals!(signals);
                         send_ui!(ui_cmd);
-                        push_center_if_dirty!();
                     }
                     DbusCmd::Close { id, reply } => {
                         let signals = core.handle_close(id);
@@ -793,7 +792,6 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                 }
                 rearm!();
@@ -807,38 +805,38 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                     UiEvent::BodyClicked(id) => {
                         let signals = core.handle_body_click(id);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                     UiEvent::ActionInvoked { id, key } => {
                         let signals = core.handle_action_invoked(id, key);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                     UiEvent::HoverChanged { id, hovered } => {
                         core.handle_hover(id, hovered, now);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        // hover does not change history
+                        // hover does not change history — skip tail dirty-check
+                        rearm!();
+                        continue;
                     }
                     UiEvent::OutputsChanged => {
                         // Nothing to do in core; UI handles relayout.
+                        // No history mutation — skip tail dirty-check.
+                        rearm!();
+                        continue;
                     }
                     UiEvent::HistoryRemoveRequested(id) => {
                         core.handle_remove_history(id);
-                        push_center_if_dirty!();
                     }
                     UiEvent::ClearHistoryRequested => {
                         core.handle_clear_history();
-                        push_center_if_dirty!();
                     }
                 }
                 rearm!();
@@ -850,7 +848,6 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                 for cmd in cmds {
                     send_ui!(cmd);
                 }
-                push_center_if_dirty!();
                 rearm!();
             }
 
@@ -862,26 +859,29 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                     IpcCmd::Close { id } => {
                         let signals = core.handle_close(id);
                         send_signals!(signals);
                         let sync = core.sync_cmd();
                         send_ui!(sync);
-                        push_center_if_dirty!();
                     }
                     IpcCmd::History { reply } => {
                         let entries = core.handle_query_history();
                         let _ = reply.send(entries).await;
+                        // Query-only — no history mutation; skip tail dirty-check.
+                        rearm!();
+                        continue;
                     }
                     IpcCmd::ClearHistory => {
                         core.handle_clear_history();
-                        push_center_if_dirty!();
                     }
                     IpcCmd::ToggleDnd { reply } => {
                         let new_state = core.handle_toggle_dnd();
                         let _ = reply.send(new_state).await;
+                        // DND toggle does not mutate history; skip tail dirty-check.
+                        rearm!();
+                        continue;
                     }
                     IpcCmd::ToggleCenter { reply } => {
                         let new_state = core.handle_toggle_center();
@@ -889,12 +889,15 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                         // Always push SetCenter on toggle (regardless of history dirty).
                         let center = core.center_cmd();
                         send_ui!(center);
-                        // Clear dirty so push_center_if_dirty doesn't double-send.
+                        // Clear dirty so the loop-tail dirty-check does not double-send.
                         core.take_history_dirty();
                     }
                     IpcCmd::Status { reply } => {
                         let status = core.handle_query_status();
                         let _ = reply.send(status).await;
+                        // Query-only — no history mutation; skip tail dirty-check.
+                        rearm!();
+                        continue;
                     }
                 }
                 rearm!();
@@ -907,11 +910,18 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                 if changed {
                     let sync = core.sync_cmd();
                     send_ui!(sync);
-                    push_center_if_dirty!();
                 }
                 rearm!();
             }
         }
+
+        // ── Loop tail: single dirty-check ────────────────────────────────────
+        // Any event that mutated history reaches here; arms that do NOT mutate
+        // history (HoverChanged, OutputsChanged, ToggleDnd, History query,
+        // Status query) use `continue` to skip this check.
+        // ToggleCenter clears the dirty flag before reaching here so it cannot
+        // double-send.
+        push_center_if_dirty!();
     }
 }
 
@@ -1036,11 +1046,6 @@ mod tests {
         let (id, _, _) =
             core.handle_notify(simple_new_with_actions(summary, actions, resident), 0, now);
         id
-    }
-
-    #[allow(dead_code)]
-    fn active_summaries(core: &Core<MockClock>) -> Vec<String> {
-        core.active.iter().map(|a| a.n.summary.clone()).collect()
     }
 
     // ── Phase-1 tests (unchanged) ──────────────────────────────────────────────
@@ -1949,6 +1954,238 @@ mod tests {
             };
 
             futures_lite::future::or(core_fut, driver).await;
+        });
+    }
+
+    // ── E4 regression tests: loop-tail center-push discipline ─────────────────
+
+    /// Helper: spin up `run()` and return the channel endpoints.
+    fn spawn_core(
+        ex: &async_executor::LocalExecutor<'_>,
+        config: Arc<Config>,
+    ) -> (
+        async_channel::Sender<DbusCmd>,
+        async_channel::Sender<UiEvent>,
+        async_channel::Receiver<UiCommand>,
+        async_channel::Sender<IpcCmd>,
+    ) {
+        let (dbus_cmd_tx, dbus_cmd_rx) = async_channel::unbounded::<DbusCmd>();
+        let (dbus_signal_tx, _dbus_signal_rx) = async_channel::unbounded::<DbusSignal>();
+        let (ui_cmd_tx, ui_cmd_rx) = async_channel::unbounded::<UiCommand>();
+        let (ui_event_tx, ui_event_rx) = async_channel::unbounded::<UiEvent>();
+        let (_config_tx, config_rx) = async_channel::unbounded::<ConfigEvent>();
+        let (ipc_tx, ipc_rx) = async_channel::unbounded::<IpcCmd>();
+
+        let handles = CoreHandles {
+            dbus_cmd_rx,
+            dbus_signal_tx,
+            ui_cmd_tx,
+            ui_event_rx,
+            config_rx,
+            ipc_rx,
+        };
+
+        ex.spawn(run(config, handles)).detach();
+        (dbus_cmd_tx, ui_event_tx, ui_cmd_rx, ipc_tx)
+    }
+
+    /// Drain all currently pending messages from a receiver without blocking.
+    async fn drain_pending<T>(rx: &async_channel::Receiver<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    /// Count `SetCenter` commands in a slice of `UiCommand`s.
+    fn count_set_center(cmds: &[UiCommand]) -> usize {
+        cmds.iter()
+            .filter(|c| matches!(c, UiCommand::SetCenter { .. }))
+            .count()
+    }
+
+    /// (a) A history-mutating event (dismiss) while center visible yields exactly
+    /// ONE SetCenter — not zero, not two.
+    #[test]
+    fn e4_history_mutation_while_center_visible_yields_one_set_center() {
+        async_io::block_on(async {
+            let ex = async_executor::LocalExecutor::new();
+            ex.run(async {
+                let (dbus_tx, _ui_event_tx, ui_cmd_rx, ipc_tx) = spawn_core(&ex, default_config());
+
+                // Give core a tick to start.
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+
+                // Toggle center open.
+                let (reply_tx, reply_rx) = async_channel::bounded::<bool>(1);
+                ipc_tx
+                    .send(IpcCmd::ToggleCenter { reply: reply_tx })
+                    .await
+                    .unwrap();
+                assert!(reply_rx.recv().await.unwrap(), "center should be visible");
+
+                // Drain pending commands (the SetCenter from ToggleCenter + initial Sync).
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+                drain_pending(&ui_cmd_rx).await;
+
+                // Send a notification and then dismiss it (puts it in history).
+                let (id_tx, id_rx) = async_channel::bounded::<u32>(1);
+                dbus_tx
+                    .send(DbusCmd::Notify {
+                        n: Box::new(NewNotification {
+                            app_name: "e4test".into(),
+                            app_icon: String::new(),
+                            summary: "e4".into(),
+                            body: String::new(),
+                            actions: vec![],
+                            urgency: Urgency::Normal,
+                            expire_timeout: Timeout::Never,
+                            image: None,
+                            transient: false,
+                            resident: false,
+                            category: None,
+                            desktop_entry: None,
+                            raw_hints: Default::default(),
+                        }),
+                        replaces_id: 0,
+                        reply: id_tx,
+                    })
+                    .await
+                    .unwrap();
+                let id = id_rx.recv().await.unwrap();
+
+                // Drain the Sync from Notify.
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+                drain_pending(&ui_cmd_rx).await;
+
+                // Dismiss (puts notification into history → history_dirty = true).
+                let (close_tx, close_rx) = async_channel::bounded::<()>(1);
+                dbus_tx
+                    .send(DbusCmd::Close {
+                        id,
+                        reply: close_tx,
+                    })
+                    .await
+                    .unwrap();
+                close_rx.recv().await.unwrap();
+
+                // Give core time to process.
+                async_io::Timer::after(std::time::Duration::from_millis(20)).await;
+
+                let cmds = drain_pending(&ui_cmd_rx).await;
+                let set_center_count = count_set_center(&cmds);
+                assert_eq!(
+                    set_center_count, 1,
+                    "expected exactly 1 SetCenter, got {set_center_count}; cmds={cmds:?}"
+                );
+            })
+            .await;
+        });
+    }
+
+    /// (b) HoverChanged does NOT produce any SetCenter (hover never touches history).
+    #[test]
+    fn e4_hover_changed_yields_no_set_center() {
+        async_io::block_on(async {
+            let ex = async_executor::LocalExecutor::new();
+            ex.run(async {
+                let (dbus_tx, ui_event_tx, ui_cmd_rx, ipc_tx) = spawn_core(&ex, default_config());
+
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+
+                // Toggle center open.
+                let (reply_tx, reply_rx) = async_channel::bounded::<bool>(1);
+                ipc_tx
+                    .send(IpcCmd::ToggleCenter { reply: reply_tx })
+                    .await
+                    .unwrap();
+                reply_rx.recv().await.unwrap();
+
+                // Create a notification to hover over.
+                let (id_tx, id_rx) = async_channel::bounded::<u32>(1);
+                dbus_tx
+                    .send(DbusCmd::Notify {
+                        n: Box::new(NewNotification {
+                            app_name: "hover-test".into(),
+                            app_icon: String::new(),
+                            summary: "hover".into(),
+                            body: String::new(),
+                            actions: vec![],
+                            urgency: Urgency::Normal,
+                            expire_timeout: Timeout::Never,
+                            image: None,
+                            transient: false,
+                            resident: false,
+                            category: None,
+                            desktop_entry: None,
+                            raw_hints: Default::default(),
+                        }),
+                        replaces_id: 0,
+                        reply: id_tx,
+                    })
+                    .await
+                    .unwrap();
+                let id = id_rx.recv().await.unwrap();
+
+                // Drain all pending before hover.
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+                drain_pending(&ui_cmd_rx).await;
+
+                // Hover on and off.
+                ui_event_tx
+                    .send(UiEvent::HoverChanged { id, hovered: true })
+                    .await
+                    .unwrap();
+                ui_event_tx
+                    .send(UiEvent::HoverChanged { id, hovered: false })
+                    .await
+                    .unwrap();
+
+                async_io::Timer::after(std::time::Duration::from_millis(20)).await;
+
+                let cmds = drain_pending(&ui_cmd_rx).await;
+                let set_center_count = count_set_center(&cmds);
+                assert_eq!(
+                    set_center_count, 0,
+                    "HoverChanged must not produce SetCenter, got {set_center_count}"
+                );
+            })
+            .await;
+        });
+    }
+
+    /// (c) ToggleCenter yields exactly ONE SetCenter (unconditional push, no double-send).
+    #[test]
+    fn e4_toggle_center_yields_exactly_one_set_center() {
+        async_io::block_on(async {
+            let ex = async_executor::LocalExecutor::new();
+            ex.run(async {
+                let (_dbus_tx, _ui_event_tx, ui_cmd_rx, ipc_tx) = spawn_core(&ex, default_config());
+
+                async_io::Timer::after(std::time::Duration::from_millis(10)).await;
+
+                // Drain any initial commands.
+                drain_pending(&ui_cmd_rx).await;
+
+                // Toggle center — must emit exactly one SetCenter.
+                let (reply_tx, reply_rx) = async_channel::bounded::<bool>(1);
+                ipc_tx
+                    .send(IpcCmd::ToggleCenter { reply: reply_tx })
+                    .await
+                    .unwrap();
+                reply_rx.recv().await.unwrap();
+
+                async_io::Timer::after(std::time::Duration::from_millis(20)).await;
+
+                let cmds = drain_pending(&ui_cmd_rx).await;
+                let set_center_count = count_set_center(&cmds);
+                assert_eq!(
+                    set_center_count, 1,
+                    "ToggleCenter must produce exactly 1 SetCenter, got {set_center_count}"
+                );
+            })
+            .await;
         });
     }
 }

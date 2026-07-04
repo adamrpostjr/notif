@@ -10,8 +10,10 @@ use std::os::unix::net::UnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use notif_types::{HistoryEntry, StatusInfo, Urgency};
-use serde::Deserialize;
+use notif_ipc::protocol::{
+    DndResponse, HistoryResponse, OkResponse, Request, StatusResponse, VisibleResponse,
+};
+use notif_types::Urgency;
 
 // ── Subcommands ───────────────────────────────────────────────────────────────
 
@@ -185,59 +187,27 @@ fn send_recv(stream: &UnixStream, request: &str) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 
-// ── Response types (local mirror of notif-ipc's private shapes) ───────────────
+// ── Response helpers ──────────────────────────────────────────────────────────
 
-/// Bare `{"ok":true}` or `{"ok":false,"error":"…"}` response.
-#[derive(Deserialize)]
-struct BaseResp {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// `{"ok":true,"dnd":<bool>}` response.
-#[derive(Deserialize)]
-struct DndResp {
-    ok: bool,
-    dnd: Option<bool>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// `{"ok":true,"visible":<bool>}` response.
-#[derive(Deserialize)]
-struct CenterResp {
-    ok: bool,
-    visible: Option<bool>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// `{"ok":true,"history":[…]}` response.
-#[derive(Deserialize)]
-struct HistoryResp {
-    ok: bool,
-    history: Option<Vec<HistoryEntry>>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// `{"ok":true,"status":{…}}` response.
-#[derive(Deserialize)]
-struct StatusResp {
-    ok: bool,
-    status: Option<StatusInfo>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// Return `Ok(())` when `ok` is true; bail with the daemon's error message otherwise.
-fn require_ok(ok: bool, error: Option<String>) -> Result<()> {
-    if ok {
-        Ok(())
-    } else {
-        bail!("{}", error.as_deref().unwrap_or("daemon returned ok:false"))
+/// Deserialize a success response of type `T`, or extract and return the daemon
+/// error string when `"ok":false`.
+///
+/// The function first checks the `"ok"` field.  When `ok` is `false` it
+/// returns the `"error"` string from the daemon.  When `ok` is `true` it
+/// deserializes into `T`.  This avoids needing optional extra fields on the
+/// typed protocol structs.
+fn parse_response<T: serde::de::DeserializeOwned>(resp: &str) -> Result<T> {
+    // Parse the bare ok/error envelope first.
+    let envelope: serde_json::Value =
+        serde_json::from_str(resp).context("invalid response JSON")?;
+    if envelope.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let msg = envelope
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon returned ok:false");
+        bail!("{msg}");
     }
+    serde_json::from_str::<T>(resp).context("invalid response JSON")
 }
 
 // ── Human-readable formatting ─────────────────────────────────────────────────
@@ -250,19 +220,11 @@ fn urgency_str(u: Urgency) -> &'static str {
     }
 }
 
-/// Format a duration (in seconds) as a compact human-readable age string.
-///
-/// Examples: `"5s"`, `"3m"`, `"2h"`, `"1d"`.
-fn relative_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86400)
-    }
+// ── Request builder ───────────────────────────────────────────────────────────
+
+/// Serialize a [`Request`] to a JSON string (single line, no trailing newline).
+fn build_request(req: &Request) -> Result<String> {
+    serde_json::to_string(req).context("serialize IPC request")
 }
 
 // ── Main logic ────────────────────────────────────────────────────────────────
@@ -273,37 +235,35 @@ fn run() -> Result<()> {
 
     match cmd {
         Cmd::DismissAll => {
-            let resp = send_recv(&stream, r#"{"cmd":"dismiss-all"}"#)?;
-            let r: BaseResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
+            let req = build_request(&Request::DismissAll)?;
+            let resp = send_recv(&stream, &req)?;
+            parse_response::<OkResponse>(&resp)?;
             println!("ok");
         }
 
         Cmd::Close { id } => {
-            let req = format!(r#"{{"cmd":"close","id":{id}}}"#);
+            let req = build_request(&Request::Close { id })?;
             let resp = send_recv(&stream, &req)?;
-            let r: BaseResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
+            parse_response::<OkResponse>(&resp)?;
             println!("ok");
         }
 
         Cmd::History { json } => {
-            let resp = send_recv(&stream, r#"{"cmd":"history"}"#)?;
+            let req = build_request(&Request::History)?;
+            let resp = send_recv(&stream, &req)?;
             if json {
                 println!("{resp}");
                 return Ok(());
             }
-            let r: HistoryResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
-            let entries = r.history.unwrap_or_default();
-            if entries.is_empty() {
+            let r = parse_response::<HistoryResponse>(&resp)?;
+            if r.history.is_empty() {
                 println!("history is empty");
             } else {
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                for entry in &entries {
+                for entry in &r.history {
                     let age_secs = now_secs.saturating_sub(entry.created_at_unix);
                     println!(
                         "[{}] {}: {} ({}, {})",
@@ -311,50 +271,44 @@ fn run() -> Result<()> {
                         entry.app_name,
                         entry.summary,
                         urgency_str(entry.urgency),
-                        relative_age(age_secs),
+                        notif_types::relative_age(age_secs),
                     );
                 }
             }
         }
 
         Cmd::ClearHistory => {
-            let resp = send_recv(&stream, r#"{"cmd":"clear-history"}"#)?;
-            let r: BaseResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
+            let req = build_request(&Request::ClearHistory)?;
+            let resp = send_recv(&stream, &req)?;
+            parse_response::<OkResponse>(&resp)?;
             println!("ok");
         }
 
         Cmd::Dnd => {
-            let resp = send_recv(&stream, r#"{"cmd":"toggle-dnd"}"#)?;
-            let r: DndResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
-            let state = if r.dnd.unwrap_or(false) { "on" } else { "off" };
+            let req = build_request(&Request::ToggleDnd)?;
+            let resp = send_recv(&stream, &req)?;
+            let r = parse_response::<DndResponse>(&resp)?;
+            let state = if r.dnd { "on" } else { "off" };
             println!("do-not-disturb: {state}");
         }
 
         Cmd::Center => {
-            let resp = send_recv(&stream, r#"{"cmd":"toggle-center"}"#)?;
-            let r: CenterResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
-            let state = if r.visible.unwrap_or(false) {
-                "shown"
-            } else {
-                "hidden"
-            };
+            let req = build_request(&Request::ToggleCenter)?;
+            let resp = send_recv(&stream, &req)?;
+            let r = parse_response::<VisibleResponse>(&resp)?;
+            let state = if r.visible { "shown" } else { "hidden" };
             println!("center: {state}");
         }
 
         Cmd::Status { json } => {
-            let resp = send_recv(&stream, r#"{"cmd":"status"}"#)?;
+            let req = build_request(&Request::Status)?;
+            let resp = send_recv(&stream, &req)?;
             if json {
                 println!("{resp}");
                 return Ok(());
             }
-            let r: StatusResp = serde_json::from_str(&resp).context("invalid response JSON")?;
-            require_ok(r.ok, r.error)?;
-            let s = r
-                .status
-                .ok_or_else(|| anyhow::anyhow!("missing status field in response"))?;
+            let r = parse_response::<StatusResponse>(&resp)?;
+            let s = r.status;
             println!("dnd:     {}", if s.dnd { "on" } else { "off" });
             println!("active:  {}", s.active);
             println!("waiting: {}", s.waiting);
@@ -382,34 +336,35 @@ fn main() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use notif_ipc::protocol::ErrResponse;
 
-    // ── relative_age ──────────────────────────────────────────────────────────
+    // ── relative_age (delegates to notif_types::relative_age) ────────────────
 
     #[test]
     fn age_seconds() {
-        assert_eq!(relative_age(0), "0s");
-        assert_eq!(relative_age(1), "1s");
-        assert_eq!(relative_age(59), "59s");
+        assert_eq!(notif_types::relative_age(0), "0s");
+        assert_eq!(notif_types::relative_age(1), "1s");
+        assert_eq!(notif_types::relative_age(59), "59s");
     }
 
     #[test]
     fn age_minutes() {
-        assert_eq!(relative_age(60), "1m");
-        assert_eq!(relative_age(300), "5m");
-        assert_eq!(relative_age(3599), "59m");
+        assert_eq!(notif_types::relative_age(60), "1m");
+        assert_eq!(notif_types::relative_age(300), "5m");
+        assert_eq!(notif_types::relative_age(3599), "59m");
     }
 
     #[test]
     fn age_hours() {
-        assert_eq!(relative_age(3600), "1h");
-        assert_eq!(relative_age(7200), "2h");
-        assert_eq!(relative_age(86399), "23h");
+        assert_eq!(notif_types::relative_age(3600), "1h");
+        assert_eq!(notif_types::relative_age(7200), "2h");
+        assert_eq!(notif_types::relative_age(86399), "23h");
     }
 
     #[test]
     fn age_days() {
-        assert_eq!(relative_age(86400), "1d");
-        assert_eq!(relative_age(259200), "3d");
+        assert_eq!(notif_types::relative_age(86400), "1d");
+        assert_eq!(notif_types::relative_age(259200), "3d");
     }
 
     // ── parse_cmd ─────────────────────────────────────────────────────────────
@@ -523,95 +478,105 @@ mod tests {
         );
     }
 
-    // ── Request serialization ─────────────────────────────────────────────────
+    // ── Request serialization via shared Request enum ─────────────────────────
 
     #[test]
     fn request_dismiss_all() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"dismiss-all"}"#).unwrap();
+        let s = build_request(&Request::DismissAll).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "dismiss-all");
     }
 
     #[test]
     fn request_close() {
-        let id: u32 = 5;
-        let req = format!(r#"{{"cmd":"close","id":{id}}}"#);
-        let v: serde_json::Value = serde_json::from_str(&req).unwrap();
+        let s = build_request(&Request::Close { id: 5 }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "close");
         assert_eq!(v["id"], 5);
     }
 
     #[test]
     fn request_history() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"history"}"#).unwrap();
+        let s = build_request(&Request::History).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "history");
     }
 
     #[test]
     fn request_clear_history() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"clear-history"}"#).unwrap();
+        let s = build_request(&Request::ClearHistory).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "clear-history");
     }
 
     #[test]
     fn request_toggle_dnd() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"toggle-dnd"}"#).unwrap();
+        let s = build_request(&Request::ToggleDnd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "toggle-dnd");
     }
 
     #[test]
     fn request_toggle_center() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"toggle-center"}"#).unwrap();
+        let s = build_request(&Request::ToggleCenter).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "toggle-center");
     }
 
     #[test]
     fn request_status() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"cmd":"status"}"#).unwrap();
+        let s = build_request(&Request::Status).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cmd"], "status");
     }
 
-    // ── Response parsing ──────────────────────────────────────────────────────
+    // ── Response parsing via shared protocol types ────────────────────────────
 
     #[test]
     fn resp_ok_true() {
-        let r: BaseResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        let r = parse_response::<OkResponse>(r#"{"ok":true}"#).unwrap();
         assert!(r.ok);
-        assert!(r.error.is_none());
     }
 
     #[test]
     fn resp_ok_false_with_error() {
-        let r: BaseResp =
+        let r: ErrResponse =
             serde_json::from_str(r#"{"ok":false,"error":"something went wrong"}"#).unwrap();
         assert!(!r.ok);
-        assert_eq!(r.error.as_deref(), Some("something went wrong"));
+        assert_eq!(r.error, "something went wrong");
+    }
+
+    #[test]
+    fn resp_error_bubbled_by_parse_response() {
+        let err = parse_response::<OkResponse>(r#"{"ok":false,"error":"kaboom"}"#).unwrap_err();
+        assert!(err.to_string().contains("kaboom"));
     }
 
     #[test]
     fn resp_dnd_on() {
-        let r: DndResp = serde_json::from_str(r#"{"ok":true,"dnd":true}"#).unwrap();
+        let r = parse_response::<DndResponse>(r#"{"ok":true,"dnd":true}"#).unwrap();
         assert!(r.ok);
-        assert_eq!(r.dnd, Some(true));
+        assert!(r.dnd);
     }
 
     #[test]
     fn resp_dnd_off() {
-        let r: DndResp = serde_json::from_str(r#"{"ok":true,"dnd":false}"#).unwrap();
+        let r = parse_response::<DndResponse>(r#"{"ok":true,"dnd":false}"#).unwrap();
         assert!(r.ok);
-        assert_eq!(r.dnd, Some(false));
+        assert!(!r.dnd);
     }
 
     #[test]
     fn resp_center_visible() {
-        let r: CenterResp = serde_json::from_str(r#"{"ok":true,"visible":true}"#).unwrap();
+        let r = parse_response::<VisibleResponse>(r#"{"ok":true,"visible":true}"#).unwrap();
         assert!(r.ok);
-        assert_eq!(r.visible, Some(true));
+        assert!(r.visible);
     }
 
     #[test]
     fn resp_center_hidden() {
-        let r: CenterResp = serde_json::from_str(r#"{"ok":true,"visible":false}"#).unwrap();
-        assert_eq!(r.visible, Some(false));
+        let r = parse_response::<VisibleResponse>(r#"{"ok":true,"visible":false}"#).unwrap();
+        assert!(!r.visible);
     }
 
     #[test]
@@ -620,21 +585,20 @@ mod tests {
             "id":1,"app_name":"test","summary":"hello","body":"world",
             "urgency":"normal","created_at_unix":1000000
         }]}"#;
-        let r: HistoryResp = serde_json::from_str(json).unwrap();
+        let r = parse_response::<HistoryResponse>(json).unwrap();
         assert!(r.ok);
-        let entries = r.history.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, 1);
-        assert_eq!(entries[0].summary, "hello");
-        assert_eq!(entries[0].urgency, Urgency::Normal);
-        assert_eq!(entries[0].created_at_unix, 1_000_000);
+        assert_eq!(r.history.len(), 1);
+        assert_eq!(r.history[0].id, 1);
+        assert_eq!(r.history[0].summary, "hello");
+        assert_eq!(r.history[0].urgency, Urgency::Normal);
+        assert_eq!(r.history[0].created_at_unix, 1_000_000);
     }
 
     #[test]
     fn resp_history_empty() {
-        let r: HistoryResp = serde_json::from_str(r#"{"ok":true,"history":[]}"#).unwrap();
+        let r = parse_response::<HistoryResponse>(r#"{"ok":true,"history":[]}"#).unwrap();
         assert!(r.ok);
-        assert_eq!(r.history.unwrap().len(), 0);
+        assert_eq!(r.history.len(), 0);
     }
 
     #[test]
@@ -644,11 +608,11 @@ mod tests {
                 r#"{{"ok":true,"history":[{{"id":1,"app_name":"a","summary":"s","body":"b","urgency":"{u}","created_at_unix":0}}]}}"#
             )
         };
-        let low: HistoryResp = serde_json::from_str(&mk("low")).unwrap();
-        assert_eq!(low.history.unwrap()[0].urgency, Urgency::Low);
+        let low = parse_response::<HistoryResponse>(&mk("low")).unwrap();
+        assert_eq!(low.history[0].urgency, Urgency::Low);
 
-        let critical: HistoryResp = serde_json::from_str(&mk("critical")).unwrap();
-        assert_eq!(critical.history.unwrap()[0].urgency, Urgency::Critical);
+        let critical = parse_response::<HistoryResponse>(&mk("critical")).unwrap();
+        assert_eq!(critical.history[0].urgency, Urgency::Critical);
     }
 
     #[test]
@@ -656,30 +620,13 @@ mod tests {
         let json = r#"{"ok":true,"status":{
             "dnd":true,"active":2,"waiting":1,"history":5,"center_visible":false
         }}"#;
-        let r: StatusResp = serde_json::from_str(json).unwrap();
+        let r = parse_response::<StatusResponse>(json).unwrap();
         assert!(r.ok);
-        let s = r.status.unwrap();
+        let s = r.status;
         assert!(s.dnd);
         assert_eq!(s.active, 2);
         assert_eq!(s.waiting, 1);
         assert_eq!(s.history, 5);
         assert!(!s.center_visible);
-    }
-
-    #[test]
-    fn require_ok_true_succeeds() {
-        assert!(require_ok(true, None).is_ok());
-    }
-
-    #[test]
-    fn require_ok_false_fails_with_message() {
-        let err = require_ok(false, Some("kaboom".into())).unwrap_err();
-        assert!(err.to_string().contains("kaboom"));
-    }
-
-    #[test]
-    fn require_ok_false_fallback_message() {
-        let err = require_ok(false, None).unwrap_err();
-        assert!(!err.to_string().is_empty());
     }
 }

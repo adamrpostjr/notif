@@ -1015,6 +1015,7 @@ name = "notif-core"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "async-executor",
  "async-io",
  "env_logger",
  "futures-lite",
@@ -1104,6 +1105,7 @@ name = "notifctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "notif-ipc",
  "notif-types",
  "serde",
  "serde_json",

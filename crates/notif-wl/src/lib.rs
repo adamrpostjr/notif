@@ -218,9 +218,6 @@ struct SurfaceState {
     /// automatically before invoking the handler; we must never ack manually,
     /// and must not attach a buffer before the first configure.
     configured: bool,
-    /// Role of this surface slot (stored for debugging and future use).
-    #[allow(dead_code)]
-    role: SurfaceRole,
 }
 
 // ── Main state struct ───────────────────────────────────────────────────────
@@ -519,7 +516,6 @@ impl WlState {
             logical_h: lh,
             mapped: false,
             configured: false,
-            role,
         };
 
         match role {

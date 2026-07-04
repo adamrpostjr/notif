@@ -396,6 +396,25 @@ pub enum UiEvent {
 #[derive(Debug, Clone)]
 pub struct ConfigEvent(pub Arc<Config>);
 
+/// Format a duration in seconds as a compact human-readable age string.
+///
+/// Returns a short label with a single-character unit suffix:
+/// `"5s"`, `"3m"`, `"2h"`, `"1d"`.  The input is the age of an event in
+/// **whole seconds** (e.g. `now_unix - created_at_unix`).
+///
+/// Callers are responsible for computing the delta; this function is pure.
+pub fn relative_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 3600 {
+        format!("{}m", age_secs / 60)
+    } else if age_secs < 86400 {
+        format!("{}h", age_secs / 3600)
+    } else {
+        format!("{}d", age_secs / 86400)
+    }
+}
+
 /// IPC commands sent from the control socket to Core (Phase 2).
 ///
 /// Variants that carry a `reply` sender use a bounded(1) channel so Core can
@@ -431,4 +450,40 @@ pub enum IpcCmd {
         /// Reply channel — Core sends a [`StatusInfo`] snapshot here.
         reply: ReplyTx<StatusInfo>,
     },
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── relative_age ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn age_seconds() {
+        assert_eq!(relative_age(0), "0s");
+        assert_eq!(relative_age(1), "1s");
+        assert_eq!(relative_age(59), "59s");
+    }
+
+    #[test]
+    fn age_minutes() {
+        assert_eq!(relative_age(60), "1m");
+        assert_eq!(relative_age(300), "5m");
+        assert_eq!(relative_age(3599), "59m");
+    }
+
+    #[test]
+    fn age_hours() {
+        assert_eq!(relative_age(3600), "1h");
+        assert_eq!(relative_age(7200), "2h");
+        assert_eq!(relative_age(86399), "23h");
+    }
+
+    #[test]
+    fn age_days() {
+        assert_eq!(relative_age(86400), "1d");
+        assert_eq!(relative_age(259200), "3d");
+    }
 }

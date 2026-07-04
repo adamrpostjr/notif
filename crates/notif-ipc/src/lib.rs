@@ -45,61 +45,101 @@ pub enum IpcError {
     CoreClosed,
 }
 
-// ── Request / response types (serde) ─────────────────────────────────────────
+// ── Public wire protocol types ────────────────────────────────────────────────
 
-/// Incoming JSON request.
-#[derive(serde::Deserialize)]
-#[serde(tag = "cmd", rename_all = "kebab-case")]
-enum Request {
-    DismissAll,
-    Close { id: u32 },
-    History,
-    ClearHistory,
-    ToggleDnd,
-    ToggleCenter,
-    Status,
+/// Public wire-protocol types shared between the IPC server and `notifctl`.
+///
+/// Every type here implements both [`serde::Serialize`] and
+/// [`serde::Deserialize`] so that both sender and receiver can use the same
+/// definitions.  The `serde` attributes are the canonical source of truth for
+/// the JSON wire format — do **not** change them without a corresponding
+/// protocol-version bump.
+pub mod protocol {
+    use notif_types::{HistoryEntry, StatusInfo};
+
+    /// Outgoing JSON request (client → server).
+    ///
+    /// Serialized as a tagged object with `"cmd"` as the tag field, using
+    /// kebab-case variant names (e.g. `{"cmd":"dismiss-all"}`).
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "cmd", rename_all = "kebab-case")]
+    pub enum Request {
+        /// Dismiss all active notifications.
+        DismissAll,
+        /// Close a specific notification by ID.
+        Close {
+            /// The notification ID to close.
+            id: u32,
+        },
+        /// Retrieve the notification history, newest first.
+        History,
+        /// Clear the entire notification history.
+        ClearHistory,
+        /// Toggle Do-Not-Disturb mode.
+        ToggleDnd,
+        /// Toggle the notification center panel.
+        ToggleCenter,
+        /// Query the current daemon status.
+        Status,
+    }
+
+    /// `{"ok":true}` — fire-and-forget success response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct OkResponse {
+        /// Always `true` for this response type.
+        pub ok: bool,
+    }
+
+    /// `{"ok":false,"error":"…"}` — error response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct ErrResponse {
+        /// Always `false` for this response type.
+        pub ok: bool,
+        /// Human-readable error description.
+        pub error: String,
+    }
+
+    /// `{"ok":true,"history":[…]}` — history query response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct HistoryResponse {
+        /// `true` on success.
+        pub ok: bool,
+        /// Notification history entries, newest first.
+        pub history: Vec<HistoryEntry>,
+    }
+
+    /// `{"ok":true,"dnd":<bool>}` — DND toggle response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct DndResponse {
+        /// `true` on success.
+        pub ok: bool,
+        /// The **new** Do-Not-Disturb state after the toggle.
+        pub dnd: bool,
+    }
+
+    /// `{"ok":true,"visible":<bool>}` — center toggle response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct VisibleResponse {
+        /// `true` on success.
+        pub ok: bool,
+        /// The **new** visibility state of the notification center panel.
+        pub visible: bool,
+    }
+
+    /// `{"ok":true,"status":{…}}` — status query response.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct StatusResponse {
+        /// `true` on success.
+        pub ok: bool,
+        /// Snapshot of the current daemon status.
+        pub status: StatusInfo,
+    }
 }
 
-/// `{"ok":true}` — fire-and-forget success.
-#[derive(serde::Serialize)]
-struct OkResponse {
-    ok: bool,
-}
-
-/// `{"ok":false,"error":"…"}` — error response.
-#[derive(serde::Serialize)]
-struct ErrResponse {
-    ok: bool,
-    error: String,
-}
-
-/// `{"ok":true,"history":[…]}` response.
-#[derive(serde::Serialize)]
-struct HistoryResponse {
-    ok: bool,
-    history: Vec<HistoryEntry>,
-}
-
-/// `{"ok":true,"dnd":<bool>}` response.
-#[derive(serde::Serialize)]
-struct DndResponse {
-    ok: bool,
-    dnd: bool,
-}
-
-/// `{"ok":true,"visible":<bool>}` response.
-#[derive(serde::Serialize)]
-struct VisibleResponse {
-    ok: bool,
-    visible: bool,
-}
-
-/// `{"ok":true,"status":{…}}` response.
-#[derive(serde::Serialize)]
-struct StatusResponse {
-    ok: bool,
-    status: StatusInfo,
-}
+// Re-export the protocol types under shorter aliases for internal use.
+use protocol::{
+    DndResponse, ErrResponse, HistoryResponse, OkResponse, Request, StatusResponse, VisibleResponse,
+};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
