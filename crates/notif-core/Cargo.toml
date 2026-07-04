@@ -5,3 +5,19 @@ edition = "2024"
 
 [lints]
 workspace = true
+
+[dependencies]
+notif-types = { path = "../notif-types" }
+notif-config = { path = "../notif-config" }
+async-channel = { workspace = true }
+async-io = { workspace = true }
+futures-lite = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+notif-dbus = { path = "../notif-dbus" }
+async-io = { workspace = true }
+env_logger = "0.11"
+
+[[example]]
+name = "headless_daemon"
