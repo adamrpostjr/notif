@@ -1,0 +1,13 @@
+[Unit]
+Description=notif notification daemon
+Documentation=https://github.com/adamrpostjr/notif
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/notifd
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
