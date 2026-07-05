@@ -1,0 +1,21 @@
+pkgbase = notif-git
+	pkgdesc = Wayland notification daemon + control center for Hyprland and other wlr-layer-shell compositors
+	pkgver = r18.709003f
+	pkgrel = 1
+	url = https://github.com/adamrpostjr/notif
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = wayland
+	depends = gcc-libs
+	depends = glibc
+	provides = notif
+	provides = notifd
+	provides = notifctl
+	conflicts = notif
+	source = notif-git::git+https://github.com/adamrpostjr/notif.git
+	sha256sums = SKIP
+
+pkgname = notif-git
