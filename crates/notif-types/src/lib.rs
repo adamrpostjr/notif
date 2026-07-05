@@ -350,15 +350,17 @@ pub enum UiCommand {
     ConfigChanged(Arc<Config>),
     /// Shut down the UI cleanly.
     Shutdown,
-    /// Show or hide the notification center panel with the given history entries.
+    /// Show or hide the notification center panel with the given content.
     ///
-    /// Pushed on every `ToggleCenter` and after any history mutation while the
-    /// center is visible.
+    /// Pushed on every `ToggleCenter` and after any active-list or history
+    /// mutation while the center is visible.
     SetCenter {
         /// Whether the center panel is now visible.
         visible: bool,
-        /// History entries ordered newest-first, as stripped `DisplayNotification`s.
-        entries: Arc<[DisplayNotification]>,
+        /// Currently-active notifications, newest first.
+        active: Arc<[DisplayNotification]>,
+        /// Closed-notification history, newest first.
+        history: Arc<[DisplayNotification]>,
     },
 }
 
@@ -395,6 +397,18 @@ pub enum UiEvent {
 /// A config-change event carrying the newly loaded config.
 #[derive(Debug, Clone)]
 pub struct ConfigEvent(pub Arc<Config>);
+
+/// Wall-clock granularity, in seconds, at which the notification-center
+/// panel's relative-age labels ("8s"/"2m") refresh while the panel is open.
+///
+/// Shared between `notif-wl` (which re-arms a timer to the next boundary of
+/// this many seconds and triggers a redraw) and `notif-render` (whose render
+/// cache key buckets `now` by this many seconds, so the cache invalidates in
+/// lockstep with the timer). Keep these two crates using this single
+/// constant rather than independent literals — they must not drift apart,
+/// or the timer could wake without the cache key having changed (a wasted
+/// redraw) or vice versa (a redraw that misses the new bucket).
+pub const CENTER_AGE_BUCKET_SECS: u64 = 10;
 
 /// Format a duration in seconds as a compact human-readable age string.
 ///

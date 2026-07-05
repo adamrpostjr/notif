@@ -91,6 +91,55 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
             message: format!("center_width must be at most 8192, got {}", c.center_width),
         });
     }
+    if let Some(width) = c.center.width
+        && (width == 0 || width > 8192)
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.width must be between 1 and 8192, got {width}"),
+        });
+    }
+    if let Some(font_size) = c.center.font_size
+        && font_size <= 0.0
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.font_size must be positive, got {font_size}"),
+        });
+    }
+    if let Some(max_entries) = c.center.max_entries
+        && (max_entries == 0 || max_entries > 10_000)
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.max_entries must be between 1 and 10000, got {max_entries}"),
+        });
+    }
+    if let Some(margin_x) = c.center.margin_x
+        && margin_x > 8192
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.margin_x must be at most 8192, got {margin_x}"),
+        });
+    }
+    if let Some(margin_y) = c.center.margin_y
+        && margin_y > 8192
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.margin_y must be at most 8192, got {margin_y}"),
+        });
+    }
+    if let Some(border_width) = c.center.border_width
+        && border_width > 512
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.border_width must be at most 512, got {border_width}"),
+        });
+    }
+    if let Some(corner_radius) = c.center.corner_radius
+        && corner_radius > 512
+    {
+        return Err(ConfigError::Validation {
+            message: format!("center.corner_radius must be at most 512, got {corner_radius}"),
+        });
+    }
     Ok(())
 }
 
@@ -218,6 +267,50 @@ mod tests {
             defaults.critical.default_timeout_ms
         );
         assert_eq!(config.center_width, defaults.center_width);
+        assert_eq!(config.center, defaults.center);
+    }
+
+    #[test]
+    fn test_center_partial_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[center]\nwidth = 320\nbackground = \"#101010\"\n").unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.center.width, Some(320));
+        assert_eq!(config.center.background, Some(Rgba::rgb(0x10, 0x10, 0x10)));
+        assert_eq!(config.center.anchor, None);
+        assert_eq!(config.center.margin_x, None);
+    }
+
+    #[test]
+    fn test_center_invalid_width_rejected() {
+        let cfg = Config {
+            center: CenterConfig {
+                width: Some(9000),
+                ..CenterConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(ConfigError::Validation { message }) if message.contains("center.width")),
+            "expected validation error mentioning center.width, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_center_invalid_max_entries_rejected() {
+        let cfg = Config {
+            center: CenterConfig {
+                max_entries: Some(0),
+                ..CenterConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(ConfigError::Validation { message }) if message.contains("center.max_entries"))
+        );
     }
 
     #[test]

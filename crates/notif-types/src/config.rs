@@ -141,6 +141,88 @@ fn default_critical_style() -> UrgencyStyle {
     }
 }
 
+/// Optional per-field overrides for the notification-center panel.
+///
+/// Every field falls back to the corresponding main-config value (or
+/// `normal`'s style, for colors/border/radius) when unset. See
+/// [`Config::center_resolved`].
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CenterConfig {
+    /// Corner to anchor the panel to. Falls back to the main `anchor`.
+    pub anchor: Option<AnchorCorner>,
+    /// Horizontal margin in pixels. Falls back to the main `margin_x`.
+    pub margin_x: Option<u32>,
+    /// Vertical margin in pixels. Falls back to the main `margin_y`.
+    pub margin_y: Option<u32>,
+    /// Panel width in logical pixels. Falls back to `center_width`.
+    pub width: Option<u32>,
+    /// Maximum number of entries (active + history) shown. Falls back to
+    /// `history_limit`.
+    pub max_entries: Option<usize>,
+    /// Font family name. Falls back to the main `font_family`.
+    pub font_family: Option<String>,
+    /// Font size in points. Falls back to the main `font_size`.
+    pub font_size: Option<f32>,
+    /// Panel background color. Falls back to `normal.background`.
+    pub background: Option<Rgba>,
+    /// Panel text color. Falls back to `normal.foreground`.
+    pub foreground: Option<Rgba>,
+    /// Panel border color. Falls back to `normal.border_color`.
+    pub border_color: Option<Rgba>,
+    /// Panel border width in pixels. Falls back to `normal.border_width`.
+    pub border_width: Option<u32>,
+    /// Panel corner radius in pixels. Falls back to `normal.corner_radius`.
+    pub corner_radius: Option<u32>,
+}
+
+impl std::hash::Hash for CenterConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.anchor.hash(state);
+        self.margin_x.hash(state);
+        self.margin_y.hash(state);
+        self.width.hash(state);
+        self.max_entries.hash(state);
+        self.font_family.hash(state);
+        self.font_size.map(f32::to_bits).hash(state);
+        self.background.hash(state);
+        self.foreground.hash(state);
+        self.border_color.hash(state);
+        self.border_width.hash(state);
+        self.corner_radius.hash(state);
+    }
+}
+
+/// Fully-resolved notification-center style after applying fallbacks from
+/// the main [`Config`]. See [`Config::center_resolved`].
+#[derive(Debug, Clone, Copy)]
+pub struct CenterResolved<'a> {
+    /// Corner to anchor the panel to.
+    pub anchor: AnchorCorner,
+    /// Horizontal margin in pixels.
+    pub margin_x: u32,
+    /// Vertical margin in pixels.
+    pub margin_y: u32,
+    /// Panel width in logical pixels.
+    pub width: u32,
+    /// Maximum number of entries (active + history) shown.
+    pub max_entries: usize,
+    /// Font family name.
+    pub font_family: &'a str,
+    /// Font size in points.
+    pub font_size: f32,
+    /// Panel background color.
+    pub background: Rgba,
+    /// Panel text color.
+    pub foreground: Rgba,
+    /// Panel border color.
+    pub border_color: Rgba,
+    /// Panel border width in pixels.
+    pub border_width: u32,
+    /// Panel corner radius in pixels.
+    pub corner_radius: u32,
+}
+
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -182,8 +264,13 @@ pub struct Config {
     pub icon_theme: Option<String>,
     /// Width of the notification center panel in logical pixels.
     ///
-    /// Valid range: 1–8192. Default: 400.
+    /// Deprecated: use `[center].width` instead. Valid range: 1–8192.
+    /// Default: 400.
     pub center_width: u32,
+    /// Notification-center panel overrides. Unset fields fall back to the
+    /// corresponding top-level value.
+    #[serde(default)]
+    pub center: CenterConfig,
 }
 
 impl Default for Config {
@@ -207,6 +294,33 @@ impl Default for Config {
             body_markup: true,
             icon_theme: None,
             center_width: 400,
+            center: CenterConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    /// Resolve the notification-center style by applying `[center]`
+    /// overrides on top of the main config's fallback values.
+    pub fn center_resolved(&self) -> CenterResolved<'_> {
+        let c = &self.center;
+        CenterResolved {
+            anchor: c.anchor.unwrap_or(self.anchor),
+            margin_x: c.margin_x.unwrap_or(self.margin_x),
+            margin_y: c.margin_y.unwrap_or(self.margin_y),
+            width: c.width.unwrap_or(self.center_width),
+            // `history_limit` may legitimately be 0 (disable history
+            // retention entirely); that's an orthogonal knob and must not
+            // also silently empty the center panel's *active* section, so
+            // floor the fallback at 1.
+            max_entries: c.max_entries.unwrap_or(self.history_limit).max(1),
+            font_family: c.font_family.as_deref().unwrap_or(&self.font_family),
+            font_size: c.font_size.unwrap_or(self.font_size),
+            background: c.background.unwrap_or(self.normal.background),
+            foreground: c.foreground.unwrap_or(self.normal.foreground),
+            border_color: c.border_color.unwrap_or(self.normal.border_color),
+            border_width: c.border_width.unwrap_or(self.normal.border_width),
+            corner_radius: c.corner_radius.unwrap_or(self.normal.corner_radius),
         }
     }
 }
@@ -232,5 +346,83 @@ impl std::hash::Hash for Config {
         self.body_markup.hash(state);
         self.icon_theme.hash(state);
         self.center_width.hash(state);
+        self.center.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn center_config_default_is_all_none() {
+        assert_eq!(CenterConfig::default(), CenterConfig::default());
+        let c = CenterConfig::default();
+        assert!(c.anchor.is_none());
+        assert!(c.width.is_none());
+        assert!(c.background.is_none());
+    }
+
+    #[test]
+    fn center_resolved_falls_back_to_main_config_when_unset() {
+        let cfg = Config::default();
+        let r = cfg.center_resolved();
+        assert_eq!(r.anchor, cfg.anchor);
+        assert_eq!(r.margin_x, cfg.margin_x);
+        assert_eq!(r.margin_y, cfg.margin_y);
+        assert_eq!(r.width, cfg.center_width);
+        assert_eq!(r.max_entries, cfg.history_limit);
+        assert_eq!(r.font_family, cfg.font_family);
+        assert_eq!(r.font_size, cfg.font_size);
+        assert_eq!(r.background, cfg.normal.background);
+        assert_eq!(r.foreground, cfg.normal.foreground);
+        assert_eq!(r.border_color, cfg.normal.border_color);
+        assert_eq!(r.border_width, cfg.normal.border_width);
+        assert_eq!(r.corner_radius, cfg.normal.corner_radius);
+    }
+
+    #[test]
+    fn center_resolved_max_entries_floors_at_one_when_history_limit_is_zero() {
+        let cfg = Config {
+            history_limit: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.center_resolved().max_entries,
+            1,
+            "history_limit=0 (disable history retention) must not also blank the \
+             center panel's active section"
+        );
+    }
+
+    #[test]
+    fn center_resolved_per_field_override() {
+        let cfg = Config {
+            center: CenterConfig {
+                width: Some(999),
+                background: Some(Rgba::rgb(1, 2, 3)),
+                ..CenterConfig::default()
+            },
+            ..Config::default()
+        };
+        let r = cfg.center_resolved();
+        assert_eq!(r.width, 999);
+        assert_eq!(r.background, Rgba::rgb(1, 2, 3));
+        // Untouched fields still fall back.
+        assert_eq!(r.margin_x, cfg.margin_x);
+        assert_eq!(r.anchor, cfg.anchor);
+    }
+
+    #[test]
+    fn center_width_field_beats_deprecated_top_level_center_width() {
+        let cfg = Config {
+            center_width: 123,
+            center: CenterConfig {
+                width: Some(456),
+                ..CenterConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(cfg.center_resolved().width, 456);
     }
 }

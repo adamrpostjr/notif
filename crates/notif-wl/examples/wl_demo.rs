@@ -118,10 +118,12 @@ async fn async_main() {
                 return;
             }
 
-            // t=9: show the notification center panel (reuse fake notifications as history).
+            // t=9: show the notification center panel (reuse fake notifications
+            // as active + history entries).
             async_io::Timer::after(Duration::from_secs(1)).await;
-            let center_entries: Arc<[DisplayNotification]> = Arc::from(vec![
-                make_notif(4, Urgency::Normal, "Back again"),
+            let center_active: Arc<[DisplayNotification]> =
+                Arc::from(vec![make_notif(4, Urgency::Normal, "Back again")]);
+            let center_history: Arc<[DisplayNotification]> = Arc::from(vec![
                 make_notif(5, Urgency::Critical, "Still critical"),
                 make_notif(6, Urgency::Low, "Low priority item"),
             ]);
@@ -129,7 +131,8 @@ async fn async_main() {
             if cmd_tx
                 .send(UiCommand::SetCenter {
                     visible: true,
-                    entries: center_entries,
+                    active: center_active,
+                    history: center_history,
                 })
                 .await
                 .is_err()
@@ -143,7 +146,8 @@ async fn async_main() {
             if cmd_tx
                 .send(UiCommand::SetCenter {
                     visible: false,
-                    entries: Arc::from(vec![]),
+                    active: Arc::from(vec![]),
+                    history: Arc::from(vec![]),
                 })
                 .await
                 .is_err()

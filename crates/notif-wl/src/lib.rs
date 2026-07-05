@@ -66,7 +66,7 @@ use wayland_protocols::wp::{
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 
-use notif_render::{HitTarget, Layout, Renderer};
+use notif_render::{CenterContent, HitTarget, Layout, Renderer};
 use notif_types::{DisplayNotification, UiCommand, UiEvent, config::Config};
 
 // ── Error type ─────────────────────────────────────────────────────────────
@@ -168,7 +168,8 @@ pub async fn run(
         toast_hover: None,
         center_hover: None,
         pending_items: Arc::from([]),
-        center_entries: Arc::from([]),
+        center_active: Arc::from([]),
+        center_history: Arc::from([]),
         center_visible: false,
         pending_redraw: false,
         shutdown: false,
@@ -251,8 +252,10 @@ struct WlState {
     center_hover: Option<HitTarget>,
     /// Latest set of items from a Sync command.
     pending_items: Arc<[DisplayNotification]>,
-    /// Center panel entries from the most recent SetCenter command.
-    center_entries: Arc<[DisplayNotification]>,
+    /// Center panel active-section entries from the most recent SetCenter command.
+    center_active: Arc<[DisplayNotification]>,
+    /// Center panel history-section entries from the most recent SetCenter command.
+    center_history: Arc<[DisplayNotification]>,
     /// Whether the center panel is currently supposed to be visible.
     center_visible: bool,
     /// True when content changed and we should re-measure + re-render.
@@ -322,15 +325,39 @@ impl WlState {
                 continue;
             }
 
-            // Race: Wayland socket readable vs UiCommand available.
-            let cmd: Option<UiCommand> = future::or(
-                async {
-                    let _ = async_fd.readable().await;
-                    None
-                },
-                async { ui_cmd_rx.recv().await.ok() },
-            )
-            .await;
+            // Race: Wayland socket readable vs UiCommand available vs the
+            // center-panel age-tick timer (re-armed to the next 10-second
+            // wall-clock boundary only while the center is visible — this
+            // keeps relative-age labels like "8s"/"2m" current without a
+            // per-notification timer in core; ages are pure presentation).
+            let want_center_tick = self.center_visible && self.center.is_some();
+            enum Wake {
+                Readable,
+                Cmd(Option<UiCommand>),
+                CenterTick,
+            }
+            let readable_fut = async {
+                let _ = async_fd.readable().await;
+                Wake::Readable
+            };
+            let cmd_fut = async { Wake::Cmd(ui_cmd_rx.recv().await.ok()) };
+            let tick_fut = async {
+                if want_center_tick {
+                    // Aligned with notif-render's cache-key bucketing via the
+                    // shared `CENTER_AGE_BUCKET_SECS` constant — must not drift.
+                    let bucket_secs = notif_types::CENTER_AGE_BUCKET_SECS;
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let wait = (bucket_secs - secs % bucket_secs).max(1);
+                    async_io::Timer::after(std::time::Duration::from_secs(wait)).await;
+                    Wake::CenterTick
+                } else {
+                    future::pending::<Wake>().await
+                }
+            };
+            let wake = future::or(future::or(readable_fut, cmd_fut), tick_fut).await;
 
             // Try to read from the Wayland socket then dispatch.
             {
@@ -345,9 +372,15 @@ impl WlState {
             }
             self.dispatch_wl()?;
 
-            // Handle any UI command we received.
-            if let Some(command) = cmd {
-                self.handle_command(command, qh)?;
+            match wake {
+                Wake::Readable => {}
+                Wake::Cmd(Some(command)) => self.handle_command(command, qh)?,
+                Wake::Cmd(None) => {}
+                Wake::CenterTick => {
+                    // Content is unchanged; only the age bucket advanced, so
+                    // this re-shapes the age labels without touching core.
+                    let _ = self.redraw(qh, SurfaceRole::Center);
+                }
             }
 
             if self.shutdown {
@@ -373,14 +406,22 @@ impl WlState {
                     self.apply_pending_toasts(qh)?;
                 }
                 if self.center_visible {
+                    // Anchor/margins may have changed; recreate rather than
+                    // mutate anchors on a live layer surface.
+                    self.destroy_surface(SurfaceRole::Center);
                     self.apply_pending_center(qh)?;
                 }
             }
             UiCommand::Shutdown => {
                 self.shutdown = true;
             }
-            UiCommand::SetCenter { visible, entries } => {
-                self.center_entries = entries;
+            UiCommand::SetCenter {
+                visible,
+                active,
+                history,
+            } => {
+                self.center_active = active;
+                self.center_history = history;
                 self.center_visible = visible;
                 self.apply_pending_center(qh)?;
             }
@@ -451,13 +492,15 @@ impl WlState {
                 )
             }
             SurfaceRole::Center => {
-                // Center panel: anchored top+right, full height.
-                // Margins come from config margin_x (right gap) and margin_y (top gap).
-                let anchor = Anchor::TOP | Anchor::RIGHT | Anchor::BOTTOM;
+                // Center panel: anchored to a single corner (like the toast
+                // stack), sized to its content height — never TOP|BOTTOM,
+                // which would make the compositor vertically center a
+                // fixed-height surface instead of pinning it to an edge.
+                let r = self.config.center_resolved();
                 (
-                    anchor,
-                    self.config.margin_x as i32,
-                    self.config.margin_y as i32,
+                    anchor_for_corner(r.anchor),
+                    r.margin_x as i32,
+                    r.margin_y as i32,
                 )
             }
         };
@@ -478,10 +521,12 @@ impl WlState {
                 (layout.width, layout.height)
             }
             SurfaceRole::Center => {
-                let layout =
-                    self.renderer
-                        .measure_center(&self.center_entries, &self.config, scale);
-                (self.config.center_width, layout.height)
+                let content = CenterContent {
+                    active: &self.center_active,
+                    history: &self.center_history,
+                };
+                let layout = self.renderer.measure_center(&content, &self.config, scale);
+                (self.config.center_resolved().width, layout.height)
             }
         };
 
@@ -598,15 +643,18 @@ impl WlState {
                 .renderer
                 .measure(&self.pending_items, &self.config, scale),
             SurfaceRole::Center => {
-                self.renderer
-                    .measure_center(&self.center_entries, &self.config, scale)
+                let content = CenterContent {
+                    active: &self.center_active,
+                    history: &self.center_history,
+                };
+                self.renderer.measure_center(&content, &self.config, scale)
             }
         };
 
         let new_lw = match role {
             SurfaceRole::Toasts => layout.width,
-            // Center: logical width is always config.center_width.
-            SurfaceRole::Center => self.config.center_width,
+            // Center: logical width is always the resolved center width.
+            SurfaceRole::Center => self.config.center_resolved().width,
         };
         let new_lh = layout.height;
 
@@ -674,11 +722,15 @@ impl WlState {
             }
             SurfaceRole::Center => {
                 let hover = self.center_hover.as_ref();
+                let content = CenterContent {
+                    active: &self.center_active,
+                    history: &self.center_history,
+                };
                 self.renderer.render_center(
                     canvas,
                     stride,
                     &layout,
-                    &self.center_entries,
+                    &content,
                     &self.config,
                     scale,
                     hover,
@@ -1001,9 +1053,10 @@ impl LayerShellHandler for WlState {
         };
         if let Some(ss) = ss {
             ss.configured = true;
-            // For toasts: only accept compositor-forced size if non-zero.
-            // For center: width is always config.center_width; compositor may
-            // supply a height for TOP|BOTTOM|RIGHT anchored surfaces.
+            // Both surfaces are single-corner-anchored and content-sized
+            // (never TOP|BOTTOM stretching), so a non-zero compositor-forced
+            // dimension is the exception, not the expected case; accept it
+            // if offered since some compositors may still suggest one.
             match role {
                 SurfaceRole::Toasts => {
                     if configure.new_size.0 != 0 {
@@ -1014,8 +1067,8 @@ impl LayerShellHandler for WlState {
                     }
                 }
                 SurfaceRole::Center => {
-                    // Fixed width from config.
-                    ss.logical_w = self.config.center_width;
+                    // Fixed width from the resolved center config.
+                    ss.logical_w = self.config.center_resolved().width;
                     // Accept compositor height if non-zero.
                     if configure.new_size.1 != 0 {
                         ss.logical_h = configure.new_size.1;

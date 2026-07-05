@@ -64,6 +64,16 @@ pub struct HitRegion {
     pub target: HitTarget,
 }
 
+/// Content shown by the notification-center panel: currently-active
+/// notifications followed by closed-notification history, each newest first.
+#[derive(Debug, Clone, Copy)]
+pub struct CenterContent<'a> {
+    /// Currently-active (live) notifications.
+    pub active: &'a [DisplayNotification],
+    /// Closed-notification history.
+    pub history: &'a [DisplayNotification],
+}
+
 /// Layout returned by [`Renderer::measure`].
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
@@ -115,7 +125,7 @@ pub trait Renderer: Send {
     /// existing tests remain valid without changes.
     fn measure_center(
         &mut self,
-        _entries: &[DisplayNotification],
+        _content: &CenterContent<'_>,
         _cfg: &Config,
         _scale: f64,
     ) -> Layout {
@@ -131,7 +141,7 @@ pub trait Renderer: Send {
         _buf: &mut [u8],
         _stride: u32,
         _layout: &Layout,
-        _entries: &[DisplayNotification],
+        _content: &CenterContent<'_>,
         _cfg: &Config,
         _scale: f64,
         _hover: Option<&HitTarget>,

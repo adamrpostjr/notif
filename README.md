@@ -20,8 +20,9 @@ font shaping (emoji/CJK/RTL all work out of the box).
 - Notification history ring, kept from the first notification.
 - Do Not Disturb mode — normal notifications are silently filed to history;
   critical notifications always break through.
-- A notification-center panel (second layer surface) listing history, with
-  per-entry dismiss and "clear all".
+- A notification-center panel (second layer surface), anchored to its own
+  corner with independent styling, showing currently-active notifications
+  live followed by history, with per-entry dismiss and "clear all".
 - `notifctl`, a small CLI to control the daemon over a local socket:
   dismiss/close, toggle DND, toggle the center panel, query history/status.
 - Hot-reloading config file — edit `config.toml`, save, and the running
@@ -183,7 +184,27 @@ history_limit = 100
 body_markup = true
 
 # Notification-center panel width (logical px, 1-8192).
+# Deprecated: use [center].width instead.
 center_width = 400
+
+# Notification-center panel overrides. Every field is optional and falls
+# back to the corresponding top-level value above (colors/border/radius
+# fall back to [normal]) when unset. The panel shows currently-active
+# notifications live, followed by history, and re-anchors to its own
+# corner independent of the toast stack's anchor.
+[center]
+# anchor = "top_right"
+# margin_x = 12
+# margin_y = 12
+# width = 400
+# max_entries = 100
+# font_family = "sans-serif"
+# font_size = 13.0
+# background = "#1e1e2e"
+# foreground = "#cdd6f4"
+# border_color = "#89b4fa"
+# border_width = 1
+# corner_radius = 8
 
 # Per-urgency appearance. Sections: [low], [normal], [critical].
 [low]

@@ -23,7 +23,7 @@ use tiny_skia::{Color, Paint, Pixmap, PixmapPaint, Stroke, Transform};
 use notif_types::config::Rgba;
 use notif_types::{DisplayNotification, ImageSource, RawImage, Urgency, config::Config};
 
-use crate::{HitRegion, HitTarget, Layout, Rect, Renderer};
+use crate::{CenterContent, HitRegion, HitTarget, Layout, Rect, Renderer};
 
 // ── Layout constants (logical pixels, multiplied by scale at use sites) ───────
 
@@ -316,8 +316,12 @@ struct CenterEntryGeometry {
     entry_rect: Rect,
     /// Left accent bar (buffer px).
     accent_rect: Rect,
-    /// '×' close-button rect (buffer px); target: `HitTarget::HistoryClose(id)`.
+    /// '×' close-button rect (buffer px); target depends on `is_active`.
     close_rect: Rect,
+    /// `true` for a live/active entry, `false` for a history entry. Active
+    /// entries get a `HitTarget::CloseButton` and a slightly lighter row
+    /// background; history entries get `HitTarget::HistoryClose`.
+    is_active: bool,
     /// Pre-shaped summary line (bold).
     summary_buffer: Buffer,
     summary_h: f32,
@@ -327,6 +331,13 @@ struct CenterEntryGeometry {
     /// Pre-shaped body line (one line, ellipsized); empty buffer → no runs.
     body_buffer: Buffer,
     has_body: bool,
+}
+
+/// Geometry + pre-shaped text for the "Earlier" section divider row, shown
+/// only when both the active and history sections are non-empty.
+struct CenterDividerGeometry {
+    rect: Rect,
+    buffer: Buffer,
 }
 
 /// Geometry for the center-panel header row.
@@ -345,7 +356,11 @@ struct CenterHeaderGeometry {
 struct CenterCachedFrame {
     key: CenterCacheKey,
     header: CenterHeaderGeometry,
+    /// Active-section entries followed by history-section entries, in the
+    /// same order as `CenterContent::active` then `CenterContent::history`.
     entries: Vec<CenterEntryGeometry>,
+    /// "Earlier" divider row, present only when both sections are non-empty.
+    divider: Option<CenterDividerGeometry>,
     /// "No notifications" placeholder buffer (None when entries is non-empty).
     placeholder_buffer: Option<Buffer>,
     /// Total buffer height (header + all entries + separator pixels).
@@ -365,9 +380,9 @@ struct CenterCacheKey {
 
 // ── Text shaping helpers (free functions to allow split borrows) ──────────────
 
-/// Map the config font family string to a cosmic-text [`Family`].
-fn family_of(cfg: &Config) -> Family<'_> {
-    match cfg.font_family.as_str() {
+/// Map a config font family string to a cosmic-text [`Family`].
+fn family_of(font_family: &str) -> Family<'_> {
+    match font_family {
         "sans-serif" => Family::SansSerif,
         "serif" => Family::Serif,
         "monospace" => Family::Monospace,
@@ -623,15 +638,19 @@ impl SkiaRenderer {
 
     // ── Center-panel helpers ───────────────────────────────────────────────────
 
-    /// Build a [`CenterCacheKey`] from the current entries, scale, and config.
+    /// Build a [`CenterCacheKey`] from the current content, scale, and config.
     ///
     /// All fields that affect center layout are folded into a single `u64`
     /// fingerprint via `DefaultHasher` — no per-entry string allocations.
-    /// Hover state is deliberately excluded so hover-only redraws are cache hits.
+    /// Hover state is deliberately excluded so hover-only redraws are cache
+    /// hits. `now` is folded in as a 10-second bucket so relative-age labels
+    /// re-shape periodically while the panel is open without re-shaping on
+    /// every single redraw.
     fn make_center_cache_key(
-        entries: &[DisplayNotification],
+        content: &CenterContent<'_>,
         scale: f64,
         cfg: &Config,
+        now: SystemTime,
     ) -> CenterCacheKey {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -641,10 +660,20 @@ impl SkiaRenderer {
         cfg.hash(&mut hasher);
         // Scale factor.
         scale.to_bits().hash(&mut hasher);
-        // Entry count (so an empty → non-empty transition is always a miss).
-        entries.len().hash(&mut hasher);
+        // Section lengths (so an empty → non-empty transition, or a move
+        // between sections, is always a miss).
+        content.active.len().hash(&mut hasher);
+        content.history.len().hash(&mut hasher);
+        // Age bucket — re-shape periodically so ages tick, in lockstep with
+        // notif-wl's redraw timer (see `notif_types::CENTER_AGE_BUCKET_SECS`).
+        let bucket = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / notif_types::CENTER_AGE_BUCKET_SECS;
+        bucket.hash(&mut hasher);
         // Per-entry content fields (hash &str directly — no allocation).
-        for dn in entries {
+        for dn in content.active.iter().chain(content.history.iter()) {
             let n = &dn.notification;
             n.id.hash(&mut hasher);
             n.summary.as_str().hash(&mut hasher);
@@ -679,16 +708,19 @@ impl SkiaRenderer {
     /// for relative-age strings (set to `now_override` in tests).
     fn compute_center_cache(
         font_system: &mut FontSystem,
-        entries: &[DisplayNotification],
+        content: &CenterContent<'_>,
         cfg: &Config,
         scale: f64,
         now: SystemTime,
     ) -> CenterCachedFrame {
+        let resolved = cfg.center_resolved();
         let s = scale as f32;
-        let buf_w = (cfg.center_width as f64 * scale).ceil() as u32;
+        let buf_w = (resolved.width as f64 * scale).ceil() as u32;
         let bw = buf_w as f32;
-        let font_size = cfg.font_size * s;
-        let family = family_of(cfg);
+        let font_size = resolved.font_size * s;
+        let family = family_of(resolved.font_family);
+
+        let total_entries = content.active.len() + content.history.len();
 
         // ── Header ────────────────────────────────────────────────────────────
         let header_h = (CENTER_HEADER_H * s).ceil() as u32;
@@ -699,7 +731,7 @@ impl SkiaRenderer {
             height: header_h,
         };
 
-        let title_text = format!("Notifications ({})", entries.len());
+        let title_text = format!("Notifications ({total_entries})");
         let title_spans = [Span {
             text: title_text,
             bold: true,
@@ -750,104 +782,142 @@ impl SkiaRenderer {
             .max(40.0);
 
         let mut y_cursor = header_h as i32;
-        let mut entry_geoms: Vec<CenterEntryGeometry> = Vec::with_capacity(entries.len());
+        let mut entry_geoms: Vec<CenterEntryGeometry> = Vec::with_capacity(total_entries);
+        let mut divider: Option<CenterDividerGeometry> = None;
 
-        for dn in entries {
-            let n = &dn.notification;
+        let sections: [(&[DisplayNotification], bool); 2] =
+            [(content.active, true), (content.history, false)];
 
-            // Summary: bold, single line.
-            let summary_spans = [Span {
-                text: n.summary.clone(),
-                bold: true,
-                italic: false,
-                underline: false,
-            }];
-            let (_, summary_h_raw, summary_buf) = clamp_spans_to_lines(
-                font_system,
-                &summary_spans,
-                family,
-                summary_font_size,
-                text_w,
-                1,
-            );
-            let summary_h = summary_h_raw.max(line_h);
+        for (section_idx, (section, is_active)) in sections.into_iter().enumerate() {
+            if section_idx == 1 && !content.active.is_empty() && !content.history.is_empty() {
+                // "Earlier" divider between the active and history sections.
+                let divider_spans = [Span::plain("Earlier")];
+                let (div_buf, _, div_h) = shape_spans(
+                    font_system,
+                    &divider_spans,
+                    family,
+                    font_size * 0.85,
+                    bw - CENTER_PADDING * s * 2.0,
+                );
+                let div_h = (div_h.max((font_size * 0.85 * 1.3).ceil())
+                    + CENTER_ENTRY_PAD * s * 2.0)
+                    .ceil() as u32;
+                divider = Some(CenterDividerGeometry {
+                    rect: Rect {
+                        x: 0,
+                        y: y_cursor,
+                        width: buf_w,
+                        height: div_h,
+                    },
+                    buffer: div_buf,
+                });
+                y_cursor += div_h as i32;
+            }
 
-            // Meta line: "{app_name} · {age}".
-            let age = Self::format_relative_age(n.created_at, now);
-            let meta_text = if n.app_name.is_empty() {
-                age
-            } else {
-                format!("{} · {}", n.app_name, age)
-            };
-            let meta_spans = [Span::plain(meta_text)];
-            let (_, meta_h_raw, meta_buf) =
-                clamp_spans_to_lines(font_system, &meta_spans, family, meta_font_size, text_w, 1);
-            let meta_h = meta_h_raw.max((meta_font_size * 1.3).ceil());
+            for dn in section {
+                let n = &dn.notification;
 
-            // Body line: one line, ellipsized (skip if empty).
-            let body_empty = n.body.trim().is_empty();
-            let (body_buf, body_h, has_body) = if body_empty {
-                let dummy = {
-                    let metrics = cosmic_text::Metrics::new(font_size, line_h);
-                    let mut b = cosmic_text::Buffer::new(font_system, metrics);
-                    b.set_size(Some(text_w.max(1.0)), None);
-                    b
-                };
-                (dummy, 0.0_f32, false)
-            } else {
-                let body_src: Vec<Span> = if cfg.body_markup {
-                    parse_markup(&n.body)
+                // Summary: bold, single line.
+                let summary_spans = [Span {
+                    text: n.summary.clone(),
+                    bold: true,
+                    italic: false,
+                    underline: false,
+                }];
+                let (_, summary_h_raw, summary_buf) = clamp_spans_to_lines(
+                    font_system,
+                    &summary_spans,
+                    family,
+                    summary_font_size,
+                    text_w,
+                    1,
+                );
+                let summary_h = summary_h_raw.max(line_h);
+
+                // Meta line: "{app_name} · {age}".
+                let age = Self::format_relative_age(n.created_at, now);
+                let meta_text = if n.app_name.is_empty() {
+                    age
                 } else {
-                    vec![Span::plain(n.body.clone())]
+                    format!("{} · {}", n.app_name, age)
                 };
-                let (b_spans, b_h, b_buf) =
-                    clamp_spans_to_lines(font_system, &body_src, family, font_size, text_w, 1);
-                let _ = b_spans;
-                (b_buf, b_h.max(line_h), true)
-            };
+                let meta_spans = [Span::plain(meta_text)];
+                let (_, meta_h_raw, meta_buf) = clamp_spans_to_lines(
+                    font_system,
+                    &meta_spans,
+                    family,
+                    meta_font_size,
+                    text_w,
+                    1,
+                );
+                let meta_h = meta_h_raw.max((meta_font_size * 1.3).ceil());
 
-            let pad = CENTER_ENTRY_PAD * s;
-            let text_total_h = summary_h + meta_h + if has_body { body_h } else { 0.0 };
-            let entry_h = (pad + text_total_h + pad + CENTER_SEP_H * s).ceil() as u32;
+                // Body line: one line, ellipsized (skip if empty).
+                let body_empty = n.body.trim().is_empty();
+                let (body_buf, body_h, has_body) = if body_empty {
+                    let dummy = {
+                        let metrics = cosmic_text::Metrics::new(font_size, line_h);
+                        let mut b = cosmic_text::Buffer::new(font_system, metrics);
+                        b.set_size(Some(text_w.max(1.0)), None);
+                        b
+                    };
+                    (dummy, 0.0_f32, false)
+                } else {
+                    let body_src: Vec<Span> = if cfg.body_markup {
+                        parse_markup(&n.body)
+                    } else {
+                        vec![Span::plain(n.body.clone())]
+                    };
+                    let (b_spans, b_h, b_buf) =
+                        clamp_spans_to_lines(font_system, &body_src, family, font_size, text_w, 1);
+                    let _ = b_spans;
+                    (b_buf, b_h.max(line_h), true)
+                };
 
-            let entry_rect = Rect {
-                x: 0,
-                y: y_cursor,
-                width: buf_w,
-                height: entry_h,
-            };
-            let accent_rect = Rect {
-                x: 0,
-                y: y_cursor,
-                width: accent_w,
-                height: entry_h,
-            };
-            let close_x = (bw - CENTER_CLOSE_INSET * s - close_sz as f32) as i32;
-            let close_y = y_cursor + ((entry_h as f32 - close_sz as f32) / 2.0) as i32;
-            let close_rect = Rect {
-                x: close_x,
-                y: close_y,
-                width: close_sz,
-                height: close_sz,
-            };
+                let pad = CENTER_ENTRY_PAD * s;
+                let text_total_h = summary_h + meta_h + if has_body { body_h } else { 0.0 };
+                let entry_h = (pad + text_total_h + pad + CENTER_SEP_H * s).ceil() as u32;
 
-            entry_geoms.push(CenterEntryGeometry {
-                entry_rect,
-                accent_rect,
-                close_rect,
-                summary_buffer: summary_buf,
-                summary_h,
-                meta_buffer: meta_buf,
-                meta_h,
-                body_buffer: body_buf,
-                has_body,
-            });
+                let entry_rect = Rect {
+                    x: 0,
+                    y: y_cursor,
+                    width: buf_w,
+                    height: entry_h,
+                };
+                let accent_rect = Rect {
+                    x: 0,
+                    y: y_cursor,
+                    width: accent_w,
+                    height: entry_h,
+                };
+                let close_x = (bw - CENTER_CLOSE_INSET * s - close_sz as f32) as i32;
+                let close_y = y_cursor + ((entry_h as f32 - close_sz as f32) / 2.0) as i32;
+                let close_rect = Rect {
+                    x: close_x,
+                    y: close_y,
+                    width: close_sz,
+                    height: close_sz,
+                };
 
-            y_cursor += entry_h as i32;
+                entry_geoms.push(CenterEntryGeometry {
+                    entry_rect,
+                    accent_rect,
+                    close_rect,
+                    is_active,
+                    summary_buffer: summary_buf,
+                    summary_h,
+                    meta_buffer: meta_buf,
+                    meta_h,
+                    body_buffer: body_buf,
+                    has_body,
+                });
+
+                y_cursor += entry_h as i32;
+            }
         }
 
         // ── Placeholder ───────────────────────────────────────────────────────
-        let placeholder_buffer = if entries.is_empty() {
+        let placeholder_buffer = if total_entries == 0 {
             let placeholder_spans = [Span::plain("No notifications")];
             let (pb, _, _) = shape_spans(
                 font_system,
@@ -862,7 +932,7 @@ impl SkiaRenderer {
         };
 
         // Total panel height: entries down to y_cursor; if empty, show a fixed placeholder height.
-        let total_buf_h = if entries.is_empty() {
+        let total_buf_h = if total_entries == 0 {
             let placeholder_h = (CENTER_ENTRY_PAD * s * 4.0 + font_size * 1.3).ceil() as u32;
             header_h + placeholder_h
         } else {
@@ -873,6 +943,7 @@ impl SkiaRenderer {
             key: CenterCacheKey { fingerprint: 0 }, // filled by caller via `frame.key = new_key`
             header: header_geom,
             entries: entry_geoms,
+            divider,
             placeholder_buffer,
             total_buf_h,
         }
@@ -906,15 +977,16 @@ impl SkiaRenderer {
         pixmap: &mut Pixmap,
         cfg: &Config,
         scale: f64,
-        entries: &[DisplayNotification],
+        content: &CenterContent<'_>,
         hover: Option<&HitTarget>,
     ) {
+        let resolved = cfg.center_resolved();
         let s = scale as f32;
         let bw = pixmap.width() as f32;
         let bh = pixmap.height() as f32;
 
         // ── Background ────────────────────────────────────────────────────────
-        let bg = cfg.normal.background;
+        let bg = resolved.background;
         // Premultiply panel background (fully opaque).
         let bg_pre = [bg.b, bg.g, bg.r, 0xff];
         // Slightly lighter header background.
@@ -922,6 +994,13 @@ impl SkiaRenderer {
             bg.b.saturating_add(0x10),
             bg.g.saturating_add(0x10),
             bg.r.saturating_add(0x10),
+            0xff,
+        ];
+        // Slightly lighter row background for active (live) entries.
+        let active_row_bg = [
+            bg.b.saturating_add(0x08),
+            bg.g.saturating_add(0x08),
+            bg.r.saturating_add(0x08),
             0xff,
         ];
         // Separator color: slightly lighter than bg.
@@ -937,7 +1016,10 @@ impl SkiaRenderer {
             return;
         };
 
-        // Fill full panel background.
+        // Fill full panel background. The border is stroked LAST (after all
+        // header/row content), since those fills are full-width, unblended
+        // overwrites that would otherwise erase the border wherever they
+        // overlap it (the header row and every active-entry row).
         let panel_rect = Rect {
             x: 0,
             y: 0,
@@ -957,16 +1039,16 @@ impl SkiaRenderer {
         Self::fill_rect_premul(pixmap, &hdr_rect, hdr_bg);
 
         // Draw title text left-aligned.
-        let fg = cfg.normal.foreground;
+        let fg = resolved.foreground;
         Self::render_spans_into(
             pixmap,
             &mut self.font_system,
             &mut self.swash_cache,
             &cached.header.title_buffer,
             CENTER_PADDING * s,
-            (header_h - cfg.font_size * s * 1.3) * 0.5,
+            (header_h - resolved.font_size * s * 1.3) * 0.5,
             header_h,
-            cfg.font_size * s,
+            resolved.font_size * s,
             fg,
         );
 
@@ -998,9 +1080,9 @@ impl SkiaRenderer {
             &mut self.swash_cache,
             &cached.header.clear_all_buffer,
             ca_rect.x as f32 + CENTER_PADDING * s,
-            (header_h - cfg.font_size * s * 1.3) * 0.5,
+            (header_h - resolved.font_size * s * 1.3) * 0.5,
             header_h,
-            cfg.font_size * s,
+            resolved.font_size * s,
             ca_fg,
         );
 
@@ -1014,9 +1096,35 @@ impl SkiaRenderer {
         Self::fill_rect_premul(pixmap, &hdr_sep_rect, sep_rgba);
 
         // ── Entries ───────────────────────────────────────────────────────────
-        let font_size_buf = cfg.font_size * s;
+        let font_size_buf = resolved.font_size * s;
         let summary_font_size = font_size_buf * 1.05_f32;
         let meta_font_size = font_size_buf * 0.9_f32;
+        // Allocation-free: this runs on every redraw, including cache-hit
+        // hover-only redraws, so avoid `.collect()`-ing a Vec just to zip.
+        let combined = content.active.iter().chain(content.history.iter());
+        let combined_len = content.active.len() + content.history.len();
+
+        // "Earlier" section divider, if present.
+        if let Some(ref div) = cached.divider {
+            Self::fill_rect_premul(pixmap, &div.rect, hdr_bg);
+            let div_fg = notif_types::config::Rgba {
+                r: fg.r,
+                g: fg.g,
+                b: fg.b,
+                a: (fg.a as u32 * 7 / 10) as u8,
+            };
+            Self::render_spans_into(
+                pixmap,
+                &mut self.font_system,
+                &mut self.swash_cache,
+                &div.buffer,
+                CENTER_PADDING * s,
+                div.rect.y as f32 + CENTER_ENTRY_PAD * s,
+                (div.rect.y + div.rect.height as i32) as f32,
+                font_size_buf * 0.85,
+                div_fg,
+            );
+        }
 
         if cached.entries.is_empty() {
             // "No notifications" placeholder.
@@ -1049,7 +1157,7 @@ impl SkiaRenderer {
                 );
             }
         } else {
-            for (idx, (dn, geo)) in entries.iter().zip(cached.entries.iter()).enumerate() {
+            for (idx, (dn, geo)) in combined.zip(cached.entries.iter()).enumerate() {
                 let n = &dn.notification;
                 let style = match n.urgency {
                     notif_types::Urgency::Low => &cfg.low,
@@ -1058,6 +1166,11 @@ impl SkiaRenderer {
                 };
                 let entry_y = geo.entry_rect.y as f32;
                 let entry_h = geo.entry_rect.height as f32;
+
+                // Active entries get a slightly lighter row background.
+                if geo.is_active {
+                    Self::fill_rect_premul(pixmap, &geo.entry_rect, active_row_bg);
+                }
 
                 // Accent bar (left edge, urgency border color).
                 let bc = style.border_color;
@@ -1069,8 +1182,13 @@ impl SkiaRenderer {
                     [accent_pre[0], accent_pre[1], accent_pre[2], accent_pre[3]],
                 );
 
-                // Row hover highlight (lighten bg slightly).
-                let close_hovered = hover.is_some_and(|t| *t == HitTarget::HistoryClose(n.id));
+                // Row hover highlight target depends on section.
+                let close_target = if geo.is_active {
+                    HitTarget::CloseButton(n.id)
+                } else {
+                    HitTarget::HistoryClose(n.id)
+                };
+                let close_hovered = hover.is_some_and(|t| *t == close_target);
 
                 // Entry text X start (after accent bar + gap).
                 let accent_w = geo.accent_rect.width as f32;
@@ -1132,7 +1250,7 @@ impl SkiaRenderer {
                 Self::draw_close_button(pixmap, &geo.close_rect, scale, fg, close_hovered);
 
                 // Hairline separator at bottom of entry (not on last entry).
-                if idx + 1 < entries.len() {
+                if idx + 1 < combined_len {
                     let sep_y = (entry_y + entry_h - CENTER_SEP_H * s).round() as i32;
                     let sep_rect = Rect {
                         x: 0,
@@ -1143,6 +1261,27 @@ impl SkiaRenderer {
                     Self::fill_rect_premul(pixmap, &sep_rect, sep_rgba);
                 }
             }
+        }
+
+        // Border stroked last so it isn't erased by the full-width header/row
+        // background fills drawn above.
+        if resolved.border_width > 0 {
+            let border_color = Color::from_rgba8(
+                resolved.border_color.r,
+                resolved.border_color.g,
+                resolved.border_color.b,
+                resolved.border_color.a,
+            );
+            Self::stroke_rounded_rect(
+                pixmap,
+                0.0,
+                0.0,
+                bw,
+                bh,
+                resolved.corner_radius as f32 * s,
+                resolved.border_width as f32 * s,
+                border_color,
+            );
         }
 
         // Put the cache back.
@@ -1576,7 +1715,7 @@ impl SkiaRenderer {
         let icon_size = cfg.icon_size as f32 * s;
         let font_size = cfg.font_size * s;
         let line_h = (font_size * 1.3).ceil();
-        let family = family_of(cfg);
+        let family = family_of(cfg.font_family.as_str());
 
         let has_icon = item.notification.image.is_some() || !item.notification.app_icon.is_empty();
         let text_x_offset = if has_icon { icon_size + padding } else { 0.0 };
@@ -2096,18 +2235,13 @@ impl Renderer for SkiaRenderer {
         }
     }
 
-    fn measure_center(
-        &mut self,
-        entries: &[DisplayNotification],
-        cfg: &Config,
-        scale: f64,
-    ) -> Layout {
-        let new_key = Self::make_center_cache_key(entries, scale, cfg);
+    fn measure_center(&mut self, content: &CenterContent<'_>, cfg: &Config, scale: f64) -> Layout {
+        let now = self.now_override.unwrap_or_else(SystemTime::now);
+        let new_key = Self::make_center_cache_key(content, scale, cfg, now);
 
         if self.center_cache.as_ref().is_none_or(|c| c.key != new_key) {
-            let now = self.now_override.unwrap_or_else(SystemTime::now);
             let mut frame =
-                Self::compute_center_cache(&mut self.font_system, entries, cfg, scale, now);
+                Self::compute_center_cache(&mut self.font_system, content, cfg, scale, now);
             frame.key = new_key;
             self.center_cache = Some(frame);
         }
@@ -2130,16 +2264,23 @@ impl Renderer for SkiaRenderer {
             target: HitTarget::ClearAll,
         });
 
-        // Close button for each entry (buffer-pixel coordinates).
-        for (dn, geo) in entries.iter().zip(cached.entries.iter()) {
+        // Close button for each entry (buffer-pixel coordinates); target
+        // depends on which section the entry belongs to.
+        let combined = content.active.iter().chain(content.history.iter());
+        for (dn, geo) in combined.zip(cached.entries.iter()) {
+            let target = if geo.is_active {
+                HitTarget::CloseButton(dn.notification.id)
+            } else {
+                HitTarget::HistoryClose(dn.notification.id)
+            };
             hit_regions.push(HitRegion {
                 rect: geo.close_rect,
-                target: HitTarget::HistoryClose(dn.notification.id),
+                target,
             });
         }
 
         Layout {
-            width: cfg.center_width,
+            width: cfg.center_resolved().width,
             height: logical_h,
             hit_regions,
         }
@@ -2151,7 +2292,7 @@ impl Renderer for SkiaRenderer {
         buf: &mut [u8],
         stride: u32,
         layout: &Layout,
-        entries: &[DisplayNotification],
+        content: &CenterContent<'_>,
         cfg: &Config,
         scale: f64,
         hover: Option<&HitTarget>,
@@ -2170,11 +2311,11 @@ impl Renderer for SkiaRenderer {
         }
 
         // Ensure the center cache is populated (measure_center may not have been called).
-        let new_key = Self::make_center_cache_key(entries, scale, cfg);
+        let now = self.now_override.unwrap_or_else(SystemTime::now);
+        let new_key = Self::make_center_cache_key(content, scale, cfg, now);
         if self.center_cache.as_ref().is_none_or(|c| c.key != new_key) {
-            let now = self.now_override.unwrap_or_else(SystemTime::now);
             let mut frame =
-                Self::compute_center_cache(&mut self.font_system, entries, cfg, scale, now);
+                Self::compute_center_cache(&mut self.font_system, content, cfg, scale, now);
             frame.key = new_key;
             self.center_cache = Some(frame);
         }
@@ -2184,7 +2325,7 @@ impl Renderer for SkiaRenderer {
             None => return,
         };
 
-        self.render_center_pixmap(&mut pixmap, cfg, scale, entries, hover);
+        self.render_center_pixmap(&mut pixmap, cfg, scale, content, hover);
 
         // Copy RGBA pixmap → BGRA output buffer (wl_shm ARGB8888 little-endian).
         let pix_data = pixmap.data();
@@ -2470,14 +2611,18 @@ mod tests {
         // Pin "now" for deterministic relative-age strings.
         renderer.now_override = Some(SystemTime::UNIX_EPOCH);
         let cfg = Config::default();
-        let entries = vec![make_test_dn(10), make_test_dn(11)];
+        let history = vec![make_test_dn(10), make_test_dn(11)];
+        let content = CenterContent {
+            active: &[],
+            history: &history,
+        };
 
         // Reset counter.
         reset_shape_count();
         let before = get_shape_count();
 
         // measure_center() — must fill the center cache.
-        let layout = renderer.measure_center(&entries, &cfg, 1.0);
+        let layout = renderer.measure_center(&content, &cfg, 1.0);
         let after_measure = get_shape_count();
         let shapes_in_measure = after_measure - before;
         assert!(
@@ -2490,7 +2635,7 @@ mod tests {
         let buf_h = (layout.height as f64 * 1.0).ceil() as u32;
         let stride = buf_w * 4;
         let mut buf = vec![0u8; (stride * buf_h) as usize];
-        renderer.render_center(&mut buf, stride, &layout, &entries, &cfg, 1.0, None);
+        renderer.render_center(&mut buf, stride, &layout, &content, &cfg, 1.0, None);
 
         let after_render1 = get_shape_count();
         assert_eq!(
@@ -2500,12 +2645,86 @@ mod tests {
 
         // render_center() again with a different hover — still a cache hit.
         let hover = HitTarget::HistoryClose(10);
-        renderer.render_center(&mut buf, stride, &layout, &entries, &cfg, 1.0, Some(&hover));
+        renderer.render_center(&mut buf, stride, &layout, &content, &cfg, 1.0, Some(&hover));
 
         let after_render2 = get_shape_count();
         assert_eq!(
             after_render2, after_render1,
             "render_center() with different hover must not reshape (hover not part of cache key)"
+        );
+    }
+
+    /// The center cache key must change once the wall-clock crosses a
+    /// 10-second bucket boundary (so relative ages tick), but stay the same
+    /// within the same bucket (so hover-only redraws inside a bucket are
+    /// still cache hits).
+    #[test]
+    fn center_cache_key_changes_across_age_bucket() {
+        use notif_types::config::Config;
+        use std::time::{Duration, SystemTime};
+
+        let cfg = Config::default();
+        let history = vec![make_test_dn(1)];
+        let content = CenterContent {
+            active: &[],
+            history: &history,
+        };
+
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let key0 = SkiaRenderer::make_center_cache_key(&content, 1.0, &cfg, t0);
+
+        // +1s: still within the same 10s bucket (100..110) → same key.
+        let t1 = t0 + Duration::from_secs(1);
+        let key1 = SkiaRenderer::make_center_cache_key(&content, 1.0, &cfg, t1);
+        assert!(
+            key0 == key1,
+            "same 10s bucket must produce the same cache key"
+        );
+
+        // +10s: crosses into the next bucket → different key.
+        let t2 = t0 + Duration::from_secs(10);
+        let key2 = SkiaRenderer::make_center_cache_key(&content, 1.0, &cfg, t2);
+        assert!(
+            key0 != key2,
+            "crossing a 10s bucket boundary must change the cache key"
+        );
+    }
+
+    /// Active entries hit-test to `CloseButton`; history entries hit-test to
+    /// `HistoryClose`.
+    #[test]
+    fn center_sections_hit_targets() {
+        use crate::Renderer;
+        use notif_types::config::Config;
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fonts");
+        let paths = vec![dir.join("DejaVuSans.ttf"), dir.join("DejaVuSans-Bold.ttf")];
+        let mut renderer = SkiaRenderer::with_font_files(&paths);
+        renderer.now_override = Some(SystemTime::UNIX_EPOCH);
+        let cfg = Config::default();
+        let active = vec![make_test_dn(1)];
+        let history = vec![make_test_dn(2)];
+        let content = CenterContent {
+            active: &active,
+            history: &history,
+        };
+
+        let layout = renderer.measure_center(&content, &cfg, 1.0);
+        let has_close_button = layout
+            .hit_regions
+            .iter()
+            .any(|r| r.target == HitTarget::CloseButton(1));
+        let has_history_close = layout
+            .hit_regions
+            .iter()
+            .any(|r| r.target == HitTarget::HistoryClose(2));
+        assert!(
+            has_close_button,
+            "active entry must hit-test to CloseButton"
+        );
+        assert!(
+            has_history_close,
+            "history entry must hit-test to HistoryClose"
         );
     }
 }

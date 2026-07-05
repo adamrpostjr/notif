@@ -40,7 +40,25 @@ history_limit = 100
 body_markup = true
 
 # Notification center panel width (logical pixels, 1–8192)
+# Deprecated: use [center].width instead.
 center_width = 400
+
+# Notification-center panel overrides. Every field is optional and falls
+# back to the corresponding top-level value above (colors/border/radius
+# fall back to [normal]) when unset. Uncomment to override.
+[center]
+# anchor = "top_right"
+# margin_x = 12
+# margin_y = 12
+# width = 400
+# max_entries = 100
+# font_family = "sans-serif"
+# font_size = 13.0
+# background = "#1e1e2e"
+# foreground = "#cdd6f4"
+# border_color = "#89b4fa"
+# border_width = 1
+# corner_radius = 8
 
 # Low urgency style
 [low]
