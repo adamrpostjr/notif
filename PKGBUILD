@@ -1,6 +1,6 @@
 # Maintainer: apost <apost@intradatech.com>
 pkgname=notif-git
-pkgver=r18.709003f
+pkgver=r22.b0ac7ed
 pkgrel=1
 pkgdesc="Wayland notification daemon + control center for Hyprland and other wlr-layer-shell compositors"
 arch=('x86_64' 'aarch64')

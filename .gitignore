@@ -1,1 +1,8 @@
 /target
+
+# makepkg build artifacts
+/notif-git/
+/pkg/
+/src/
+*.pkg.tar.zst
+*.pkg.tar.xz
